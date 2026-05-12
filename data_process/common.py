@@ -19,14 +19,7 @@ class Signal(IntEnum):
     POSITIVE  = 2
 
 eps = 1e-8
-# Volatility multiplier guidance (typically 0.5 ~ 1.0)
-'''
-Multiplier, sigma threshold, interpretation
-VOL_MULTIPLIER=1.0, 1σ, ~31.8% of price moves exceed this threshold (two tails).
-VOL_MULTIPLIER=0.5, 0.5σ, ~61.7% of price moves exceed this threshold; moderate signal frequency.
-VOL_MULTIPLIER=1.5, 1.5σ, only ~13.4% of price moves exceed this threshold.
-VOL_MULTIPLIER=2.0, 2σ, only ~4.6% of price moves exceed this threshold.
-'''
+
 DATA_PROCESS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(DATA_PROCESS_DIR)
 OUTPUT_DIR = os.path.join(PROJECT_DIR, 'output')
@@ -40,12 +33,12 @@ class BaseDefine:
     vol_ewma_span: int  = 80
     predict_num: int = 16
     # risk / vol
-    vol_multiplier_long: float = 3.2
+    vol_multiplier_long: float = 1
     stop_multiplier_rate_long: Optional[float] = None
-    vol_multiplier_short: float = 3.2
+    vol_multiplier_short: float = 1
     stop_multiplier_rate_short: Optional[float] = None
     # market
-    symbol: str = "DOGEUSDT"    #BTCUSDT ETHUSDT DOGEUSDT
+    symbol: str = "BTCUSDT"    #BTCUSDT ETHUSDT DOGEUSDT
     interval: str = "15m"
     trading_type:str ='spot'             #spot  / um(USDT-M Futures) / cm    (Coin-M Futures)   
     version:float = 0.1

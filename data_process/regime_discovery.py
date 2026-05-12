@@ -721,6 +721,220 @@ class LabelRegimeAnalyzer:
         plt.close()
         print(f"✅ 2nd derivative plot saved: {output_dir}/vol_vs_distribution_2nd_derivative.png")
 
+    def plot_distribution_for_stop_rate(
+        self,
+        stop_rate,
+        output_dir=None,
+        smooth_window: int = 3,
+        include_gaussian: bool = True,
+    ):
+        """
+        Plot label distribution, first derivative, and second derivative
+        for one selected stop_rate using self.results_df produced by
+        run_parameter_sweep().
+
+        Distribution plot:
+            positive / negative / neutral proportions on left axis,
+            positive-negative ratio on right axis.
+
+        Derivative plots:
+            only positive / negative / neutral derivatives.
+        """
+
+        if output_dir is None:
+            output_dir = self.output_dir
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        if self.results_df is None:
+            print("⚠️ Please run run_parameter_sweep() first.")
+            return None
+
+        # 1. Select one stop_rate from saved sweep results
+        df_plot = self.results_df[
+            np.isclose(self.results_df["stop_rate"], stop_rate)
+        ].copy()
+
+        if df_plot.empty:
+            print("⚠️ No rows found for the specified stop_rate.")
+            return None
+
+        # 2. Ensure numeric vol_multiplier and sort
+        df_plot["vol_multiplier"] = pd.to_numeric(
+            df_plot["vol_multiplier"],
+            errors="coerce",
+        )
+
+        df_plot = df_plot.dropna(subset=["vol_multiplier"]).copy()
+        df_plot = df_plot.sort_values("vol_multiplier").reset_index(drop=True)
+
+        if df_plot.empty:
+            print("⚠️ No numeric vol_multiplier values available.")
+            return None
+
+        v = df_plot["vol_multiplier"].to_numpy(dtype=float)
+
+        if len(v) < 2:
+            print("⚠️ At least two vol_multiplier values are required for first derivative.")
+            return None
+
+        # 3. Helper functions
+        def smooth_series(y):
+            y = pd.Series(y)
+
+            if smooth_window is not None and smooth_window > 1:
+                return (
+                    y.rolling(
+                        window=smooth_window,
+                        center=True,
+                        min_periods=1,
+                    )
+                    .mean()
+                    .to_numpy(dtype=float)
+                )
+
+            return y.to_numpy(dtype=float)
+
+        def compute_derivatives(y):
+            y_smooth = smooth_series(y)
+            d1 = np.gradient(y_smooth, v)
+
+            if len(v) >= 3:
+                d2 = np.gradient(d1, v)
+            else:
+                d2 = np.full_like(y_smooth, np.nan, dtype=float)
+
+            return y_smooth, d1, d2
+
+        # 4. Prepare empirical curves
+        p_pos_raw = df_plot["p_long"].to_numpy(dtype=float)
+        p_neg_raw = df_plot["p_short"].to_numpy(dtype=float)
+        p_neu_raw = df_plot["p_neutral"].to_numpy(dtype=float)
+
+        p_pos, d1_pos, d2_pos = compute_derivatives(p_pos_raw)
+        p_neg, d1_neg, d2_neg = compute_derivatives(p_neg_raw)
+        p_neu, d1_neu, d2_neu = compute_derivatives(p_neu_raw)
+
+        ls_ratio = p_pos_raw / np.where(np.isclose(p_neg_raw, 0.0), np.nan, p_neg_raw)
+        ls_ratio = smooth_series(ls_ratio)
+
+        # 5. Gaussian reference curves
+        if include_gaussian:
+            p_not_neutral = 2 * (1 - norm.cdf(v))
+            g_pos = p_not_neutral / 2
+            g_neg = p_not_neutral / 2
+            g_neu = 1 - p_not_neutral
+
+            g_d1_pos = np.gradient(g_pos, v)
+            g_d1_neg = np.gradient(g_neg, v)
+            g_d1_neu = np.gradient(g_neu, v)
+
+            if len(v) >= 3:
+                g_d2_pos = np.gradient(g_d1_pos, v)
+                g_d2_neg = np.gradient(g_d1_neg, v)
+                g_d2_neu = np.gradient(g_d1_neu, v)
+            else:
+                g_d2_pos = g_d2_neg = g_d2_neu = None
+
+        # 6. Distribution plot
+        fig, ax1 = plt.subplots(figsize=(12, 7))
+
+        ax1.plot(v, p_pos, color="green", marker="o", linewidth=2.5, label="Positive %")
+        ax1.plot(v, p_neg, color="red", marker="s", linewidth=2.5, label="Negative %")
+        ax1.plot(v, p_neu, color="gray", marker="^", linewidth=2.0, linestyle="--", label="Neutral %")
+
+        if include_gaussian:
+            ax1.plot(v, g_pos, color="green", linestyle=":", linewidth=1.5, alpha=0.8, label="Positive Gaussian")
+            ax1.plot(v, g_neg, color="red", linestyle=":", linewidth=1.5, alpha=0.8, label="Negative Gaussian")
+            ax1.plot(v, g_neu, color="black", linestyle=":", linewidth=1.5, alpha=0.8, label="Neutral Gaussian")
+
+        ax1.set_xlabel("Volatility Multiplier", fontsize=12)
+        ax1.set_ylabel("Class Proportion", fontsize=12)
+        ax1.set_ylim(-0.05, 1.05)
+        ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+        ax1.legend(loc="upper left", frameon=True, shadow=True)
+
+        ax2 = ax1.twinx()
+        ax2.plot(
+            v,
+            ls_ratio,
+            color="blue",
+            marker="D",
+            linewidth=1.5,
+            alpha=0.7,
+            label="Pos/Neg Ratio",
+        )
+        ax2.axhline(y=1.0, color="black", linestyle=":", alpha=0.5)
+        ax2.set_ylabel("Positive / Negative Ratio", fontsize=12, color="blue")
+        ax2.tick_params(axis="y", labelcolor="blue")
+        ax2.legend(loc="lower left", bbox_to_anchor=(0.01, 0.15), frameon=True)
+
+        plt.title("Label Distribution vs Volatility Multiplier", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+
+        dist_path = os.path.join(output_dir, "distribution.png")
+        plt.savefig(dist_path, dpi=250)
+        plt.close()
+
+        # 7. First derivative plot
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        ax.plot(v, d1_pos, color="green", marker="o", linewidth=2.5, label="d Positive / dλ")
+        ax.plot(v, d1_neg, color="red", marker="s", linewidth=2.5, label="d Negative / dλ")
+        ax.plot(v, d1_neu, color="gray", marker="^", linewidth=2.0, linestyle="--", label="d Neutral / dλ")
+
+        if include_gaussian:
+            ax.plot(v, g_d1_pos, color="green", linestyle=":", linewidth=1.5, alpha=0.8, label="d Positive Gaussian")
+            ax.plot(v, g_d1_neg, color="red", linestyle=":", linewidth=1.5, alpha=0.8, label="d Negative Gaussian")
+            ax.plot(v, g_d1_neu, color="black", linestyle=":", linewidth=1.5, alpha=0.8, label="d Neutral Gaussian")
+
+        ax.axhline(y=0.0, color="black", linestyle=":", alpha=0.5)
+        ax.set_xlabel("Volatility Multiplier", fontsize=12)
+        ax.set_ylabel("First Derivative", fontsize=12)
+        ax.grid(True, which="both", linestyle="--", alpha=0.4)
+        ax.legend(loc="best", frameon=True, shadow=True)
+
+        plt.title("First Derivative of Label Distribution", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+
+        d1_path = os.path.join(output_dir, "distribution_1st_derivative.png")
+        plt.savefig(d1_path, dpi=250)
+        plt.close()
+
+        # 8. Second derivative plot
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        ax.plot(v, d2_pos, color="green", marker="o", linewidth=2.5, label="d² Positive / dλ²")
+        ax.plot(v, d2_neg, color="red", marker="s", linewidth=2.5, label="d² Negative / dλ²")
+        ax.plot(v, d2_neu, color="gray", marker="^", linewidth=2.0, linestyle="--", label="d² Neutral / dλ²")
+
+        if include_gaussian and g_d2_pos is not None:
+            ax.plot(v, g_d2_pos, color="green", linestyle=":", linewidth=1.5, alpha=0.8, label="d² Positive Gaussian")
+            ax.plot(v, g_d2_neg, color="red", linestyle=":", linewidth=1.5, alpha=0.8, label="d² Negative Gaussian")
+            ax.plot(v, g_d2_neu, color="black", linestyle=":", linewidth=1.5, alpha=0.8, label="d² Neutral Gaussian")
+
+        ax.axhline(y=0.0, color="black", linestyle=":", alpha=0.5)
+        ax.set_xlabel("Volatility Multiplier", fontsize=12)
+        ax.set_ylabel("Second Derivative", fontsize=12)
+        ax.grid(True, which="both", linestyle="--", alpha=0.4)
+        ax.legend(loc="best", frameon=True, shadow=True)
+
+        plt.title("Second Derivative of Label Distribution", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+
+        d2_path = os.path.join(output_dir, "distribution_2nd_derivative.png")
+        plt.savefig(d2_path, dpi=250)
+        plt.close()
+
+        print(f"✅ Distribution plot saved: {dist_path}")
+        print(f"✅ First derivative plot saved: {d1_path}")
+        print(f"✅ Second derivative plot saved: {d2_path}")
+
+        return {
+            "distribution": dist_path,
+            "first_derivative": d1_path,
+            "second_derivative": d2_path,
+        }
 
 # --- Running example ---
 if __name__ == "__main__":

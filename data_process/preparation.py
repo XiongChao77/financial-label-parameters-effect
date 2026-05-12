@@ -14,13 +14,18 @@ def plot_label_distribution(df, interval_ms, para, label_function):
     
     # Define a finer grid to capture gradients
     vol_range = np.arange(0.1, 5, 0.1).round(2)   #not include 3.1
-    stop_range = [0.1,0.2, 0.3, 0.5,2,100,1000,np.inf]  #np.arange(100, 100.1, 0.1).round(1)   #not include 1.6
+    stop_range = [np.inf]  #np.arange(100, 100.1, 0.1).round(1)   #not include 1.6
     
     analyzer.run_parameter_sweep(vol_range, stop_range, label_function)
     # analyzer.analyze_and_plot()
     analyzer.plot_vol_vs_distribution()
     analyzer.plot_null_hypothesis_comparison()
     analyzer.plot_long_ratio_vs_vol_multiplier()
+    analyzer.plot_distribution_for_stop_rate(
+        stop_rate=np.inf,
+        smooth_window=3,
+        include_gaussian=True,
+    )
 
 def summary_statistics(para,prep_output_dir,df, label_col, logger):
     # ---------------- Summary statistics ----------------
@@ -47,6 +52,18 @@ def summary_statistics(para,prep_output_dir,df, label_col, logger):
     # ---------------------------------------------------------
     split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1]) - pd.DateOffset(months=8)
     train_df, test_df = df[df['open_time_date_utc'] < str(split_ts)], df[df['open_time_date_utc'] >= str(split_ts)]
+
+    start_time = train_df['open_time_date_utc'].iloc[0]
+    end_time = train_df['open_time_date_utc'].iloc[-1]
+    duration = pd.to_datetime(end_time) - pd.to_datetime(start_time)
+    logger.info(f"Train Time span: {start_time} -> {end_time} (total: {duration})")
+
+    counts = train_df[label_col].value_counts().sort_index()
+    proportions = train_df[label_col].value_counts(normalize=True).sort_index()
+    for label_val, cnt in counts.items():
+        label_name = "Down" if label_val == 0 else ("Up" if label_val == 2 else ("Neutral" if label_val == 1 else "INVALID"))
+        pct_val = proportions[label_val]
+        logger.info(f"Label {label_val} ({label_name}): {cnt} rows, ratio {pct_val:.4%}")
 
     # Write to prep_output_dir (default common.DATA_OUT_DIR; independent per batch worker)
     out_dir = prep_output_dir
@@ -102,17 +119,22 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
             df.loc[is_unanimous, label_col] = df.loc[is_unanimous, label_cols[0]]
             
             return df
-        for v_range in np.arange(0.1, 4, 0.1).round(1):
+
+        label_strictest = label_col
+        for v_range in np.arange(0.1, 4.5, 0.1).round(1):
             para.vol_multiplier_long = v_range
             para.stop_multiplier_rate_long = None
             para.vol_multiplier_short = v_range
             para.stop_multiplier_rate_short = None
             label_suffix = f"v{int(round(v_range * 10)):02d}"
-            df = common.attach_label(df, para=para, label_col=f'label_{label_suffix}')
+            para_label = f'label_{label_suffix}'
+            df = common.attach_label(df, para=para, label_col=para_label)
+            label_strictest = para_label
             # Call after the loop finishes
         df = generate_strict_consensus_label(df)
         # ---------------- Summary statistics ----------------
-        summary_statistics(para, prep_output_dir, df, label_col, logger)
+        logger.info("strictest label column is %s", label_strictest)
+        summary_statistics(para, prep_output_dir, df, label_strictest, logger)
     elif args.mode == 'label':
         df = common.attach_label(df, para=para, label_col=f'label')
         summary_statistics(para, prep_output_dir, df, label_col, logger)

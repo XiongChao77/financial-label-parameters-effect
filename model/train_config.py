@@ -139,15 +139,15 @@ DEFAULT_FEATURES: List[str] = [
 
 @dataclass
 class TrainConfig:
-    seq_len: int = 216     # 160 best for LSTM
+    seq_len: int = 96
     feature_conf_list: List[str] = field(default_factory=lambda: DEFAULT_FEATURES)
-    stride: int = 2
+    stride: int = 1
     seed: int = 42
     n_iterations: int = 3
 
     # LogisticRegression hyperparameters (for probe)
     lr_C: float = 1.0
-    lr_max_iter: int = 1000
+    lr_max_iter: int = 500
     lr_solver: str = "lbfgs"  # Optional: 'saga' reduces warnings but may be slower
 
 # feature_direction_map: 特征名 -> ic_direction (1 正向 / -1 负向)
