@@ -935,23 +935,3 @@ class LabelRegimeAnalyzer:
             "first_derivative": d1_path,
             "second_derivative": d2_path,
         }
-
-# --- Running example ---
-if __name__ == "__main__":
-    import logging
-    # Load data logic (adjust according to your project path)
-    df_raw = pd.read_csv(common.origin_data_path)
-    df_clean = common.clean_data_quality_auto(df_raw, logging.getLogger('dummy'))
-    
-    # Get period milliseconds
-    interval_ms = common.get_interval_ms('5m')
-    
-    analyzer = LabelRegimeAnalyzer(df_clean, interval_ms, symbol="ETHUSDT", interval='5m')
-    
-    # Generate parameter range according to your required interval
-    vol_range = np.round(np.linspace(0.5, 3.0, 26), 1) # 0.5 to 3.0, interval 0.1
-    stop_range = [0.5, 1.0, 1.5, 2.0] # Example stop range
-    
-    analyzer.run_parameter_sweep(vol_range, stop_range)
-    analyzer.analyze_and_plot()
-    analyzer.plot_null_hypothesis_comparison()

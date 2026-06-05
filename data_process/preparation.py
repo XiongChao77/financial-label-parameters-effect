@@ -27,7 +27,78 @@ def plot_label_distribution(df, interval_ms, para, label_function):
         include_gaussian=True,
     )
 
+def summary_statistics_stock(para, prep_output_dir, df, label_col, logger):
+    """
+    针对股票日线数据优化的统计与保存函数
+    适配格式: date, open, high, low, close, volume
+    """
+    # 1. 确保日期格式正确
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # ---------------- 基础时间跨度统计 ----------------
+    start_time = df['date'].iloc[0]
+    end_time = df['date'].iloc[-1]
+    duration = end_time - start_time
+    logger.info(f"📊 数据时间跨度: {start_time.date()} -> {end_time.date()} (总计: {duration.days} 天)")
+
+    # ---------------- 标签分布统计 ----------------
+    counts = df[label_col].value_counts().sort_index()
+    proportions = df[label_col].value_counts(normalize=True).sort_index()
+    
+    logger.info("\n=== 标签分布汇总 (Label Distribution) ===")
+    label_map = {0: "Down (Short)", 1: "Neutral", 2: "Up (Long)", -1: "INVALID"}
+    
+    for label_val, cnt in counts.items():
+        name = label_map.get(label_val, "Unknown")
+        pct = proportions[label_val]
+        logger.info(f"Label {label_val:>2} ({name:<12}): {cnt:>6} 行, 占比 {pct:.2%}")
+
+    # ---------------- 动态阈值分析 ----------------
+    if 'threshold_long' in df.columns and 'threshold_short' in df.columns:
+        logger.info("\n=== 动态波动率阈值分析 (Dynamic Thresholds) ===")
+        for side in ['long', 'short']:
+            col = f'threshold_{side}'
+            logger.info(f"{side.capitalize():<5} Threshold | Min: {df[col].min():.4%}, Max: {df[col].max():.4%}, Mean: {df[col].mean():.4%}")
+    
+    # ---------------- 数据切分 (Train/Test Split) ----------------
+    # 沿用你代码中 8 个月的切分逻辑，如果是多年日线数据，可以根据需要调整为 20%
+    split_date = df['date'].max() - pd.DateOffset(months=8)
+    train_df = df[df['date'] < split_date].copy()
+    test_df = df[df['date'] >= split_date].copy()
+
+    logger.info(f"\n📂 数据集切分结果:")
+    logger.info(f"   - 训练集: {len(train_df)} 行 (截至 {train_df['date'].max().date()})")
+    logger.info(f"   - 测试集: {len(test_df)} 行 (始于 {test_df['date'].min().date()})")
+
+    # ---------------- 保存数据与元数据 ----------------
+    os.makedirs(prep_output_dir, exist_ok=True)
+    
+    # 调用你 common 中的保存方法
+    common.save_train_df_to_dir(train_df, prep_output_dir)
+    common.save_test_df_to_dir(test_df, prep_output_dir)
+    
+    # 保存配置 JSON
+    meta_path = common.get_data_config_path_in_dir(prep_output_dir)
+    para_dict = asdict(para)
+    # 确保 JSON 中没有无法序列化的对象
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(common.json_safe(para_dict), f, indent=4, ensure_ascii=False)
+
+    logger.info(f"✅ 数据准备完成。配置文件已写入: {meta_path}")
+
 def summary_statistics(para,prep_output_dir,df, label_col, logger):
+    label_cols = [
+        col for col in df.columns 
+        if col.startswith('label_') and not any(sub in col for sub in ['index', 'id', 'exit', 'price', 'threshold', 'strength', 'stop'])
+    ]
+    
+    if label_cols:
+        # 此时剩下的全部是真正的标签列（如 label_3.5_3.5），再从中安全地寻找 0 最少的列
+        label_col = min(label_cols, key=lambda c: int((df[c] == 0).sum()))
+        logger.info(f"strictest label column is {label_col}")
+    else:
+        logger.warning("No valid columns starting with 'label_' found. Using the default passed label_col.")
+
     # ---------------- Summary statistics ----------------
     start_time = df['open_time_date_utc'].iloc[0]
     end_time = df['open_time_date_utc'].iloc[-1]
@@ -80,8 +151,8 @@ def summary_statistics(para,prep_output_dir,df, label_col, logger):
     logger.info(f"📍 Interval: {para.interval}")
     logger.info(f"📍 Config written to: {meta_path}")
 
-def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR ):
-    file = os.path.join(common.PROJECT_DATA_DIR, para.trading_type ,f"{para.symbol}_{para.interval}.csv")
+def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR,**kwargs ):
+    file = os.path.join(common.PROJECT_DATA_DIR,para.market_category, para.data_source ,para.trading_type ,f"{para.symbol}_{para.interval}.csv")
     logger.info(f"using file :{file}")
     # 1. Convert interval string to milliseconds
     interval_ms = common.get_interval_ms(para.interval)
@@ -91,7 +162,7 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
     # Rows with volume==0 typically have little impact on price, so dropping them often won't hurt training/testing.
     # In real-world feeds, volume==0 can exist; we keep them by default.
     # Feature engineering must explicitly handle volume==0 cases.
-    df = common.clean_data_quality_auto(df,logger)  
+    df = common.clean_data_quality_auto(df,logger)
     # 3. Pass interval_ms to label logic so it can adapt its volatility window to the real time span.
     label_col = 'label'
     if args.mode == 'plot':
@@ -120,21 +191,32 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
             
             return df
 
-        label_strictest = label_col
-        for v_range in np.arange(0.1, 4.5, 0.1).round(1):
-            para.vol_multiplier_long = v_range
+        if para.para_type == 'volatility':
+            para.predict_num = kwargs['predict_num']
+            volatility_range = kwargs['volatility_range']
+            for t_range in volatility_range:
+                para.vol_multiplier_long = t_range
+                para.stop_multiplier_rate_long = None
+                para.vol_multiplier_short = t_range
+                para.stop_multiplier_rate_short = None
+                label_suffix = f"v{int(round(t_range * 10)):02d}"
+                para_label = f'label_{label_suffix}'
+                df = common.attach_label(df, para=para, label_col=para_label)
+        elif para.para_type == 'horizon':
+            vol_multiplier = kwargs['vol_multiplier']
+            para.vol_multiplier_long = vol_multiplier
             para.stop_multiplier_rate_long = None
-            para.vol_multiplier_short = v_range
+            para.vol_multiplier_short = vol_multiplier
             para.stop_multiplier_rate_short = None
-            label_suffix = f"v{int(round(v_range * 10)):02d}"
-            para_label = f'label_{label_suffix}'
-            df = common.attach_label(df, para=para, label_col=para_label)
-            label_strictest = para_label
-            # Call after the loop finishes
+            horizon_range = kwargs['horizon_range']
+            for t_range in horizon_range:
+                para.predict_num = t_range
+                label_suffix = f"h{int(round(t_range * 10)):02d}"
+                para_label = f'label_{label_suffix}'
+                df = common.attach_label(df, para=para, label_col=para_label)
         df = generate_strict_consensus_label(df)
         # ---------------- Summary statistics ----------------
-        logger.info("strictest label column is %s", label_strictest)
-        summary_statistics(para, prep_output_dir, df, label_strictest, logger)
+        summary_statistics(para, prep_output_dir, df, label_col, logger)
     elif args.mode == 'label':
         df = common.attach_label(df, para=para, label_col=f'label')
         summary_statistics(para, prep_output_dir, df, label_col, logger)
@@ -148,8 +230,20 @@ if __name__ == "__main__":
         "--mode", 
         choices=["plot", "label", "batch_label"], 
         default="batch_label",
-        help="Action to perform: 'plot' the distribution or 'label' the data and run stats (default: label)"
-    )
+        help="Action to perform: 'plot' the distribution or 'label' the data and run stats (default: label)")
+    
     args = parser.parse_args()
     logger, _ = common.setup_session_logger(sub_folder='dissertation/data_process')
-    main(logger, args, common.FEATURE_GROUP_LIST)
+    
+    main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.5, 8, 0.5).round(1),predict_num=16) 
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(4, 80, 10), vol_multiplier = 4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.5, 8, 0.5).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(2, 80, 10), vol_multiplier = 4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_volatility, volatility_range= np.arange(0.5, 8, 0.5).round(1), predict_num = 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_horizon, horizon_range= np.arange(2, 24, 2), vol_multiplier=3)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_volatility, volatility_range= np.arange(0.5, 6, 0.5), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_horizon, horizon_range= np.arange(2, 16, 4), vol_multiplier=4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_volatility, volatility_range= np.arange(1, 4, 0.2).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_horizon, horizon_range= np.arange(4, 80, 2), vol_multiplier=2)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_volatility, volatility_range= np.arange(1, 3, 0.2).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_horizon, horizon_range= np.arange(4, 16, 2), vol_multiplier= 2)

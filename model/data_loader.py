@@ -7,7 +7,7 @@ from data_process import common
 
 # number_of_trades and volume are highly correlated; quote_asset_volume and volume are also highly correlated.
 #taker_buy_quote_volume--taker_buy_base_volume,
-DROP_FEATURES =['threshold_long', 'stop_threshold_long','threshold_short', 'stop_threshold_short', 'label', 'trend_strength', 'open_time_ms_utc', 'open_time_date_utc',
+DROP_FEATURES =['threshold_long', 'stop_threshold_long','threshold_short', 'stop_threshold_short', 'label', 'trend_strength', 'open_time_ms_utc', 'open_time_sn', 'open_time_date_utc',
                  'close_time_ms_utc', 'ignore' ]
 LOW_CORRELATION_FEATURES = ['number_of_trades','quote_asset_volume', 'taker_buy_quote_volume']
 
@@ -36,7 +36,7 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         self.kline_interval_ms = kline_interval_ms
         self.feature_cols = feature_cols  # Keep a copy of requested feature list
         self.label_col = label_col
-        self.time_col = 'open_time_ms_utc'
+        self.time_col = 'open_time_sn'
         self.factory = common.FeatureFactory(self.kline_interval_ms)
 
         missing = set(feature_cols) - set(df.columns)
@@ -89,7 +89,6 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         data_to_save = {
             "X": self.X,
             "y": self.y,
-            "returns": self.returns,
             "indices": self.indices,
             "feature_names": self.feature_names,
             "feature_count": self.feature_count,
@@ -113,12 +112,6 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
             # --- Strict parameter comparison ---
             # 1. Basic scalar parameter validation
             mismatch_reasons = []
-            self.returns = checkpoint.get("returns") 
-            
-            # Backward compatibility: older caches may not contain returns
-            if self.returns is None:
-                self.logger.error("🚨 Cache missing 'returns'! Please delete cache file and regenerate.")
-                return False
 
             if self.stride != checkpoint.get("stride"):
                 mismatch_reasons.append(f"stride ({checkpoint.get('stride')} -> {self.stride})")
@@ -174,11 +167,6 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         clean_features = [c for c in feature_cols if c not in DROP_FEATURES]
         cols = clean_features + ([label_col] if label_col and label_col in df.columns else []) + [self.time_col]
         
-        # Core change: always include trend_strength in extracted columns (but it's not part of clean_features)
-        if 'trend_strength' in df.columns:
-            if 'trend_strength' not in cols:
-                cols.append('trend_strength')
-
         df_work = df[cols].copy()
         if not self.is_live:
             df_work['orig_index'] = df.index
@@ -203,6 +191,8 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
 
         # --- Part 2: remove NaNs in the middle or tail (abnormal gaps) ---
         before_gap_clean = len(df_work)
+        na_counts = df_work.isna().sum()
+        print(na_counts[na_counts > 0])
         df_work.dropna(inplace=True)  # Remaining NaNs are in the middle or tail
         after_gap_clean = len(df_work)
         
@@ -237,20 +227,19 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         """
         original_count = len(X3d)
         has_label = (label_col is not None) and (label_col in df_work.columns)
-        interval = self.kline_interval_ms
 
         # --- A. Continuity mask computation ---
         
         # 1. Global span check (e.g., allow limited gaps)
         global_actual_span = time_windows[:, -1] - time_windows[:, 0]
-        global_ideal_span = (self.window - 1) * interval
+        global_ideal_span = (self.window - 1)
         # You may tune tolerance here; currently 0 tolerance
-        mask_global = (global_actual_span <= global_ideal_span) 
+        mask_global = (global_actual_span <= global_ideal_span)
 
         # 2. Strict tail check (last N bars)
         check_tail_count = 2
         tail_actual_span = time_windows[:, -1] - time_windows[:, -(check_tail_count + 1)]
-        tail_ideal_span = check_tail_count * interval
+        tail_ideal_span = check_tail_count
         mask_tail = (tail_actual_span <= tail_ideal_span)
 
         # --- B. Label validity check ---
@@ -291,16 +280,6 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
             self.logger.warning(f"   - ❌ Dropped (label invalid/INVALID): {fail_label}")
         self.logger.info(f"   - ✅ Final kept: {final_count} ({final_count/original_count:.2%})")
     
-        if 'trend_strength' in df_work.columns:
-            # Use the same slicing as labels: start at window-1 and sample by stride
-            aligned_returns = df_work['trend_strength'].values[self.window - 1 :: self.stride]
-            df_work.drop(columns=['trend_strength'], inplace=True)
-            # Truncate to match window count
-            self.returns = aligned_returns[:original_count][final_mask]
-        else:
-            self.logger.warning("⚠️ Missing trend_strength in df_work; returns set to 0")
-            self.returns = np.zeros(final_count)
-
         return X3d[final_mask], labels_all[final_mask], final_indices
 
     def _finalize_dataset(self, X_filtered, y_filtered, final_indices):
@@ -309,7 +288,6 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
 
         self.X = torch.from_numpy(X_filtered)
         self.y = torch.from_numpy(y_filtered).long()
-        self.returns = torch.from_numpy(self.returns).float()
         self.indices = final_indices
         # --- Auto-print stats for review ---
         if self.show_feature_distribution:
@@ -367,7 +345,7 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, i):
-        return self.X[i], self.y[i], self.returns[i]
+        return self.X[i], self.y[i]
 def should_regenerate_cache(cache_path, data_path, feature_file, data_cfg):
     """
     Decide whether to regenerate cache by checking file modification times and a config hash.

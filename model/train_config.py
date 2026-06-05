@@ -12,7 +12,7 @@ class DataConfig:
 
 @dataclass
 class BaseModelConfig:
-    seq_len: int = 216
+    seq_len: int = 16
     model_type: str = "base"
     model_version: int = 1
 
@@ -131,15 +131,15 @@ DEFAULT_FEATURES: List[str] = [
     "low",
     "close",
     "volume",
-    "number_of_trades",
-    "quote_asset_volume",
-    "taker_buy_base_volume",
-    "taker_buy_quote_volume",
+    # "number_of_trades",
+    # "quote_asset_volume",
+    # "taker_buy_base_volume",
+    # "taker_buy_quote_volume",
 ]
 
 @dataclass
 class TrainConfig:
-    seq_len: int = 96
+    seq_len: int = 8
     feature_conf_list: List[str] = field(default_factory=lambda: DEFAULT_FEATURES)
     stride: int = 1
     seed: int = 42

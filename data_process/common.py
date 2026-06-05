@@ -29,31 +29,50 @@ os.makedirs(DATA_OUT_DIR, exist_ok=True)
 
 @dataclass
 class BaseDefine:
-    # model / data
+    #data source
+    market_category: str = "Cryptocurrency"   # cryptocurrency / stock / forex
+    data_source: str = "binance_public_data"                   # binance / yahoo / local_csv
+    # model
     vol_ewma_span: int  = 80
     predict_num: int = 16
     # risk / vol
-    vol_multiplier_long: float = 1
+    vol_multiplier_long: float = 4
     stop_multiplier_rate_long: Optional[float] = None
-    vol_multiplier_short: float = 1
+    vol_multiplier_short: float = 4
     stop_multiplier_rate_short: Optional[float] = None
     # market
     symbol: str = "BTCUSDT"    #BTCUSDT ETHUSDT DOGEUSDT
+    trading_type:str ='spot'             #spot  / um(USDT-M Futures) / cm    (Coin-M Futures)
     interval: str = "15m"
-    trading_type:str ='spot'             #spot  / um(USDT-M Futures) / cm    (Coin-M Futures)   
+    para_type:str =  'horizon'  # volatility / horizon
+    label_type:str = 'FTHL' # TBM / FTHL
     version:float = 0.1
+
+BTC_15m_fthl_volatility = BaseDefine(market_category="Cryptocurrency", data_source="binance_public_data", symbol="BTCUSDT", interval="15m", trading_type='spot', para_type = 'volatility', label_type = 'FTHL')
+BTC_15m_fthl_horizon = BaseDefine(market_category="Cryptocurrency", data_source="binance_public_data", symbol="BTCUSDT", interval="15m", trading_type='spot', para_type = 'horizon', label_type = 'FTHL')
+BTC_15m_tbm_volatility = BaseDefine(market_category="Cryptocurrency", data_source="binance_public_data", symbol="BTCUSDT", interval="15m", trading_type='spot', para_type = 'volatility', label_type = 'TBM')
+BTC_15m_tbm_horizon = BaseDefine(market_category="Cryptocurrency", data_source="binance_public_data", symbol="BTCUSDT", interval="15m", trading_type='spot', para_type = 'horizon', label_type = 'TBM')
+
+QQQ_15m_fthl_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="15m", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'FTHL')
+QQQ_15m_fthl_horizon = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="15m", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'FTHL')
+QQQ_15m_tbm_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="15m", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'TBM')
+QQQ_15m_tbm_horizon = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="15m", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'TBM')
+
+QQQ_1d_fthl_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'FTHL')
+QQQ_1d_fthl_horizon = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'FTHL')
+QQQ_1d_tbm_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'TBM')
+QQQ_1d_tbm_horizon = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'TBM')
+
+# SPY_1d_fthl_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="SPY", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon')
 
 log_level = logging.INFO
 
-PROJECT_DATA_DIR = os.path.join(os.path.dirname(PROJECT_DIR),'QuantData','Cryptocurrency','binance_public_data')
-origin_data_path = os.path.join(PROJECT_DATA_DIR, f"{BaseDefine.symbol}_{BaseDefine.interval}.csv")
+PROJECT_DATA_DIR = os.path.join(os.path.dirname(PROJECT_DIR),'QuantData')
 train_data_path = os.path.join(DATA_OUT_DIR, "train_data.csv")
 test_data_path  = os.path.join(DATA_OUT_DIR, "test_data.csv")
 data_config_path  = os.path.join(DATA_OUT_DIR, "data_config_meta.json")
 TRAIN_OUT_DIR = os.path.join(OUTPUT_DIR, "train")
 os.makedirs(TRAIN_OUT_DIR, exist_ok=True)
-EXPERIMENT_DIR = os.path.join(PROJECT_DATA_DIR, "experiment")
-os.makedirs(EXPERIMENT_DIR, exist_ok=True)
 
 CONF_DF = 'to_feather'#/'to_feather'/'to_csv'
 
@@ -147,7 +166,189 @@ def attach_attr(df, feature_group_list, feature_conf_list = [], para = BaseDefin
     kline_interval_ms = get_interval_ms(para.interval)
     return FeatureFactory(kline_interval_ms,feature_group_list, feature_conf_list).generate(df)
 
-def attach_label(df, para = BaseDefine, label_col = 'label'):
+def attach_fthl_stock_daily(df, para=BaseDefine(), label_col='label'):
+    # 1. Compute asymmetric dynamic thresholds
+    df = calculate_thresholds(df, para)
+
+    n = len(df)
+    df['open_time_sn'] = np.arange(len(df), dtype=np.int64)
+    idx = np.arange(n)
+    target_indices = idx + int(para.predict_num)
+
+    final_valid_mask = target_indices < n
+    safe_idx = np.where(final_valid_mask, target_indices, 0)
+
+    exit_index_col = f"{label_col}_exit_index"
+    exit_price_col = f"{label_col}_exit_price"
+
+    # 2. Store exit metadata
+    df[exit_index_col] = np.where(
+        final_valid_mask,
+        target_indices,
+        -1,
+    ).astype(np.int64)
+
+    # 3. Compute forward close return
+    future_close = np.where(
+        final_valid_mask,
+        df["close"].values[safe_idx],
+        np.nan,
+    )
+
+    df[exit_price_col] = future_close
+
+    pct_final = np.log(future_close / df["close"])
+
+    # 4. Compute path-dependent high/low within future trading-bar window
+    high_mtx = np.column_stack(
+        [
+            df["high"].shift(-i).values
+            for i in range(1, int(para.predict_num) + 1)
+        ]
+    )
+
+    low_mtx = np.column_stack(
+        [
+            df["low"].shift(-i).values
+            for i in range(1, int(para.predict_num) + 1)
+        ]
+    )
+
+    # For stock daily, valid horizon is exactly predict_num trading bars.
+    # Invalid tail rows are masked by final_valid_mask.
+    future_high_max = np.maximum.accumulate(high_mtx, axis=1)[
+        np.arange(n),
+        int(para.predict_num) - 1,
+    ]
+
+    future_low_min = np.minimum.accumulate(low_mtx, axis=1)[
+        np.arange(n),
+        int(para.predict_num) - 1,
+    ]
+
+    max_drawdown = (future_low_min - df["close"]) / df["close"]
+    max_runup = (future_high_max - df["close"]) / df["close"]
+
+    # 5. Apply asymmetric label logic
+    cond_long = (
+        final_valid_mask
+        & (pct_final > df["threshold_long"])
+        & (max_drawdown > -df["stop_threshold_long"])
+    )
+
+    cond_short = (
+        final_valid_mask
+        & (pct_final < -df["threshold_short"])
+        & (max_runup < df["stop_threshold_short"])
+    )
+
+    conditions = [
+        ~final_valid_mask,
+        cond_short,
+        cond_long,
+    ]
+
+    choices = [
+        Signal.INVALID,
+        Signal.NEGATIVE,
+        Signal.POSITIVE,
+    ]
+
+    df[label_col] = np.select(
+        conditions,
+        choices,
+        default=Signal.NEUTRAL,
+    ).astype(int)
+
+    return df
+
+    # 1. 兼容时间戳：将纳秒转为通用的毫秒
+import numpy as np
+
+def attach_fthl_stock_minutely(df, para=BaseDefine(), label_col='label'):
+    if 'window_start' in df.columns and 'open_time_ms_utc' not in df.columns:
+        df['open_time_ms_utc'] = df['window_start'] // 1000000
+
+    df = df.sort_values("open_time_ms_utc").reset_index(drop=True)
+
+    # 2. 计算动态波动率阈值 (内部已剔除跳空)
+    df = calculate_us_stock_mins_thresholds(df, para)
+
+    time_col = 'open_time_ms_utc'
+    time_values = df[time_col].values
+    interval_ms = get_interval_ms(para.interval)
+    n = len(df)
+    
+    # ---------------------------------------------------------
+    # 修改点 1：将 open_time_sn 改为严格连续的自增标注
+    # 供下游特征处理模块校验输入序列（Lookback Window）的连续性
+    # ---------------------------------------------------------
+    open_time_sn = np.arange(n, dtype=np.int64)
+    df['open_time_sn'] = np.arange(n, dtype=np.int64)
+
+    # ---------------------------------------------------------
+    # 修改点 2：严格校验预测窗口，不允许隔夜、不允许中间断层
+    # ---------------------------------------------------------
+    idx = np.arange(n)
+    # 强制让目标索引就是往后数 predict_num 根 K 线
+    target_indices = idx + int(para.predict_num)
+    
+    in_bounds = target_indices < n
+    safe_idx = np.where(in_bounds, target_indices, 0)
+    
+    # 预期中“完美的”未来物理时间
+    target_times = time_values + (para.predict_num * interval_ms)
+    
+    # 灵魂判定：只有当向后数 predict_num 根 K 线的时间，
+    # 刚好等同于理想的 target_times 时，才算合法。
+    # 一旦中间发生隔夜跳空或缺失，物理时间一定会严重大于 target_times，被无情过滤为 False。
+    final_valid_mask = in_bounds & (time_values[safe_idx] == target_times)
+
+    exit_index_col = f"{label_col}_exit_index"
+    df[exit_index_col] = np.where(final_valid_mask, target_indices, -1).astype(np.int64)
+
+    exit_price_col = f"{label_col}_exit_price"
+    future_close = np.where(final_valid_mask, df['close'].values[safe_idx], np.nan)
+    df[exit_price_col] = future_close
+    pct_final = np.log(future_close / df['close'])
+
+    # 计算路径极值：
+    # 因为现在的 target_indices 严格等于当前 index + predict_num，
+    # 所以直接取所有 predict_num 列的最大最小值即可，无需再做复杂的 clip 截断
+    high_mtx = np.column_stack([df['high'].shift(-i).values for i in range(1, para.predict_num + 1)])
+    low_mtx = np.column_stack([df['low'].shift(-i).values for i in range(1, para.predict_num + 1)])
+    
+    future_high_max = np.maximum.accumulate(high_mtx, axis=1)[:, para.predict_num - 1]
+    future_low_min = np.minimum.accumulate(low_mtx, axis=1)[:, para.predict_num - 1]
+
+    max_drawdown = (future_low_min - df['close']) / df['close']
+    max_runup = (future_high_max - df['close']) / df['close']
+
+    # 4. 非对称标签逻辑
+    cond_long = final_valid_mask & (pct_final > df['threshold_long']) & (max_drawdown > -df['stop_threshold_long'])
+    cond_short = final_valid_mask & (pct_final < -df['threshold_short']) & (max_runup < df['stop_threshold_short'])
+
+    conditions = [~final_valid_mask, cond_short, cond_long]
+    choices = [Signal.INVALID, Signal.NEGATIVE, Signal.POSITIVE]
+    df[label_col] = np.select(conditions, choices, default=Signal.NEUTRAL).astype(int)
+    
+    return df
+
+def attach_label(df, para = BaseDefine(), label_col = 'label'):
+    if para.label_type == 'FTHL':
+        return attach_fthl_label(df, para, label_col)
+    elif para.label_type == 'TBM':
+        return attach_tbm_label(df, para, label_col)
+    else:
+        raise ValueError
+
+# fixed-time horizon labeling
+def attach_fthl_label(df, para = BaseDefine(), label_col = 'label'):
+    if para.market_category == "Stock":
+        if 'd' in para.interval:
+            return attach_fthl_stock_daily(df, para, label_col)
+        elif 'm' in para.interval:
+            return attach_fthl_stock_minutely(df, para, label_col)
     """
     Path-dependent asymmetric labeling logic.
     """
@@ -159,14 +360,23 @@ def attach_label(df, para = BaseDefine, label_col = 'label'):
 
     # 2. Physical time anchoring (unchanged)
     interval_ms = get_interval_ms(para.interval)
+    df['open_time_sn'] = df[time_col]// interval_ms
     target_times = time_values + (para.predict_num * interval_ms)
     target_indices = np.searchsorted(time_values, target_times, side='left')
     in_bounds = target_indices < len(df)
     safe_idx = np.where(in_bounds, target_indices, 0)
     final_valid_mask = in_bounds & (time_values[safe_idx] == target_times)
 
+    exit_index_col = f"{label_col}_exit_index"
+    # This is safer than using i + predict_num because K-lines may be missing.
+    df[exit_index_col] = np.where(final_valid_mask, target_indices, -1).astype(np.int64)
+
+    exit_price_col = f"{label_col}_exit_price"
+
     # 3. Compute forward return and extreme moves (unchanged)
     future_close = np.where(final_valid_mask, df['close'].values[safe_idx], np.nan)
+
+    df[exit_price_col] = future_close
     pct_final = np.log(future_close / df['close'])
 
     high_mtx = np.column_stack([df['high'].shift(-i).values for i in range(1, para.predict_num + 1)])
@@ -195,16 +405,6 @@ def attach_label(df, para = BaseDefine, label_col = 'label'):
     choices = [Signal.INVALID, Signal.NEGATIVE, Signal.POSITIVE ]
     df[label_col] = np.select(conditions, choices, default=Signal.NEUTRAL).astype(int)
     
-    # volatility normalized return
-    df['trend_strength'] = np.where(
-        pct_final >= 0,
-        pct_final / (df['threshold_long'] + eps),
-        np.abs(pct_final) / (df['threshold_short'] + eps)
-    )
-
-    # Handle invalid rows (out-of-bounds in physical time)
-    df.loc[~final_valid_mask, 'trend_strength'] = np.nan
-    
     return df
 
 # Advances in Financial Machine Learning by Dr. Marcos López de Prado (2018) introduced the triple barrier method for labeling financial data, which is a more sophisticated approach than simple return-based labeling. The method considers both profit-taking and stop-loss barriers, as well as a time limit, to determine the label of each sample. Below is an implementation of the triple barrier method in Python, using Numba for performance optimization.
@@ -219,7 +419,8 @@ def calculate_thresholds(df, para=BaseDefine, **kwargs):
     df = df.copy()
     df['ret'] = df['close'] / df['close'].shift(1) - 1
     ewma_vol = df['ret'].ewm(span=para.vol_ewma_span, adjust=False).std()
-    expected_vol = ewma_vol * np.sqrt(para.predict_num)
+    # expected_vol = ewma_vol * np.sqrt(para.predict_num)
+    expected_vol = ewma_vol
     df['expected_vol'] = expected_vol
 
     # ===== 4️⃣ Asymmetric thresholds =====
@@ -238,32 +439,62 @@ def calculate_thresholds(df, para=BaseDefine, **kwargs):
 
     return df
 
-def print_zret_statistics(df, label_col='label'):
-    print("\n================ trend_strength Statistics ================\n")
+def calculate_us_stock_mins_thresholds(df, para=BaseDefine):
+    """
+    计算动态波动率阈值。
+    新增逻辑：剔除美股隔夜跳空缺口对 EWMA 波动率的污染。
+    """
+    assert 'close' in df.columns, "Missing column: close"
+    df = df.copy()
+    
+    # 1. 计算原始的 K线到K线 收益率
+    df['ret'] = df['close'] / df['close'].shift(1) - 1
 
-    valid = df['trend_strength'].notna()
+    # 2. 识别“每日首根 K 线”以剔除隔夜跳空
+    if 'datetime_utc' in df.columns:
+        df['datetime_utc'] = pd.to_datetime(df['datetime_utc'], utc=True)
+        # 确保时区正确，转换为美东时间来判断自然日
+        if df['datetime_utc'].dt.tz is None:
+            dt_est = pd.to_datetime(df['datetime_utc'], utc=True).dt.tz_convert('US/Eastern')
+        else:
+            dt_est = df['datetime_utc'].dt.tz_convert('US/Eastern')
+        
+        # 提取日期 (YYYY-MM-DD)
+        trade_dates = dt_est.dt.date
+        
+        # 如果当前行的日期和上一行不一样，说明这是新的一天的第一根 K 线
+        is_new_day = trade_dates != trade_dates.shift(1)
+        
+        # 将跳空收益率设为 NaN，这样 ewm.std() 会自动忽略它，不会污染波动率均值
+        df.loc[is_new_day, 'ret'] = np.nan
+        
+    # 3. 计算 EWMA 波动率 (忽略 NaN)
+    ewma_vol = df['ret'].ewm(span=para.vol_ewma_span, adjust=False, ignore_na=True).std()
+    
+    expected_vol = ewma_vol
+    df['expected_vol'] = expected_vol
 
-    overall = df.loc[valid, 'trend_strength']
+    # ===== 4️⃣ 非对称阈值 =====
+    df['threshold_long'] = expected_vol * para.vol_multiplier_long
+    df['threshold_short'] = expected_vol * para.vol_multiplier_short
 
-    print("Overall trend_strength distribution:")
-    print(overall.describe(percentiles=[0.5,0.75,0.9,0.95,0.99]))
+    if getattr(para, 'stop_multiplier_rate_long', None) is not None:
+        df['stop_threshold_long'] = df['threshold_long'] * para.stop_multiplier_rate_long
+    else:
+        df['stop_threshold_long'] = np.inf
 
-    print("\nBy label:")
+    if getattr(para, 'stop_multiplier_rate_short', None) is not None:
+        df['stop_threshold_short'] = df['threshold_short'] * para.stop_multiplier_rate_short
+    else:
+        df['stop_threshold_short'] = np.inf
 
-    for label in sorted(df[label_col].unique()):
-        sub = df.loc[(df[label_col] == label) & valid, 'trend_strength']
-
-        if len(sub) == 0:
-            continue
-
-        print(f"\nLabel {label}  count={len(sub)}")
-        print(sub.describe(percentiles=[0.5,0.75,0.9,0.95,0.99]))
+    return df
 
 @njit(cache=True)
 def fast_triple_barrier_kernel(close, high, low, thresholds, window):
     n = len(close)
-    labels = np.ones(n, dtype=np.int32)        # 默认中性 (1)
-    reach_times = np.full(n, window, dtype=np.int32) 
+    labels = np.ones(n, dtype=np.int32)         # 默认中性 (1)
+    reach_times = np.full(n, window, dtype=np.int32) # 默认到期窗口长度
 
     l_tp_p = thresholds[:, 0]
     l_sl_p = thresholds[:, 1]
@@ -279,56 +510,91 @@ def fast_triple_barrier_kernel(close, high, low, thresholds, window):
         s_tp = p0 * (1 - s_tp_p[i])
         s_sl = p0 * (1 + s_sl_p[i])
         
-        # 用来记录该样本是否在窗口内达成过目标
+        # 用来记录该样本在窗口内达成 TP 或 SL 的最早步数
         first_l_tp = window + 1
         first_s_tp = window + 1
+        first_l_sl = window + 1
+        first_s_sl = window + 1
         
-        # 用来标记该侧是否已经由于止损而“死亡”
         l_active = True
         s_active = True
 
         for j in range(1, window + 1):
             curr_idx = i + j
-            h, l, c = high[curr_idx], low[curr_idx], close[curr_idx]
+            h, l = high[curr_idx], low[curr_idx]
             
             # --- 多头路径判定 ---
             if l_active:
-                if c >= l_tp:      # 先碰 TP
+                hit_l_tp = (h >= l_tp)
+                hit_l_sl = (l <= l_sl)
+                
+                if hit_l_tp and hit_l_sl:
+                    # 极端波动：单根K线同时触碰止盈与止损
+                    # 秉持悲观原则，假设先被止损
+                    first_l_sl = j
+                    l_active = False 
+                elif hit_l_sl:
+                    first_l_sl = j
+                    l_active = False 
+                elif hit_l_tp:
                     first_l_tp = j
-                    l_active = False # 达成目标，不再更新
-                elif l <= l_sl:    # 先碰 SL
-                    l_active = False # 死亡
-            
+                    l_active = False
+
             # --- 空头路径判定 ---
             if s_active:
-                if c <= s_tp:      # 先碰 TP
+                hit_s_tp = (l <= s_tp)
+                hit_s_sl = (h >= s_sl)
+                
+                if hit_s_tp and hit_s_sl:
+                    # 极端波动：单根K线同时触碰止盈与止损
+                    # 秉持悲观原则，假设先被止损
+                    first_s_sl = j
+                    s_active = False
+                elif hit_s_sl:
+                    first_s_sl = j
+                    s_active = False
+                elif hit_s_tp:
                     first_s_tp = j
                     s_active = False
-                elif h >= s_sl:    # 先碰 SL
-                    s_active = False
 
-            # 如果多空都已经有了结果（无论是 TP 还是 SL），提前退出
+            # 如果多空都已经有了明确结果（无论触碰了TP还是SL），提前退出循环
             if not l_active and not s_active:
                 break
 
-        # --- 最终决策 ---
-        # 只有在各自的路径中“获胜”（TP先于SL）才有资格参与比较
+        # --- 最终决策逻辑 ---
+        # 规则 1：多头获胜条件 —— 多头触碰过 TP，且步数严格领先于空头触发 TP 的步数
         if first_l_tp <= window and first_l_tp < first_s_tp:
             labels[i] = 2 # Signal.POSITIVE
             reach_times[i] = first_l_tp
+            
+        # 规则 2：空头获胜条件 —— 空头触碰过 TP，且步数严格领先于多头触发 TP 的步数
         elif first_s_tp <= window and first_s_tp < first_l_tp:
             labels[i] = 0 # Signal.NEGATIVE
             reach_times[i] = first_s_tp
+            
+        # 规则 3：双输、双触或均未触发 —— 判定为中性
         else:
             labels[i] = 1 # Signal.NEUTRAL
-            # reach_times 保持默认值或设为第一次发生 SL 的时间
-            
+            # 如果是中性标签，这里记录下最早发生止损的步数，方便回测引擎做非重叠仓位的时间跨度截断
+            min_sl = min(first_l_sl, first_s_sl)
+            if min_sl <= window:
+                reach_times[i] = min_sl
+            else:
+                reach_times[i] = window
+                
     return labels, reach_times
 
-def attach_triple_barrier_label(df, para=BaseDefine, label_col = 'label'):
-    # 1. 获取基础阈值
-    df = calculate_thresholds(df, para)
-    
+def attach_tbm_label(df, para=BaseDefine(), label_col = 'label'):
+    if para.market_category == "Stock":
+        df['open_time_sn'] = np.arange(len(df), dtype=np.int64)
+        if 'd' in para.interval:
+            df = calculate_thresholds(df, para)
+        elif 'm' in para.interval:
+            df = calculate_us_stock_mins_thresholds(df, para)
+    elif para.market_category == "cryptocurrency":
+        df['open_time_sn'] = df['open_time_ms_utc']// interval_ms
+        df = calculate_thresholds(df, para)
+
     # 2. 准备底层数据
     close = df['close'].values.astype(np.float64)
     high = df['high'].values.astype(np.float64)
@@ -343,17 +609,13 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col = 'label'):
     
     window = int(para.predict_num)
     
-    # 3. 调用 Numba 加速计算
     labels, reach_times = fast_triple_barrier_kernel(
         close, high, low, thresholds, window
     )
     
-    # 4. 写入结果
     df[label_col] = labels
     df['reach_time'] = reach_times
     
-    # 5. 物理时间校验 (掩码处理)
-    # 确保在 predict_num 步之后的时间戳与物理时间对齐
     interval_ms = get_interval_ms(para.interval)
     time_values = df['open_time_ms_utc'].values
     target_times = time_values + (window * interval_ms)
@@ -364,10 +626,14 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col = 'label'):
     valid_idx = np.where(in_bounds)[0]
     time_match[valid_idx] = (time_values[target_indices[valid_idx]] == target_times[valid_idx])
     
-    # 处理无效行
     df.loc[~time_match, label_col] = -1       # Signal.INVALID
     df.loc[~time_match, 'reach_time'] = -1  # 无效到达时间
-    
+
+    df[f"{label_col}_threshold_long"] = df["threshold_long"]
+    df[f"{label_col}_threshold_short"] = df["threshold_short"]
+    df[f"{label_col}_stop_threshold_long"] = df["stop_threshold_long"]
+    df[f"{label_col}_stop_threshold_short"] = df["stop_threshold_short"]
+
     return df
 
 def print_label_performance_stats(df, para=BaseDefine):
@@ -430,241 +696,6 @@ def print_label_performance_stats(df, para=BaseDefine):
             print(f"  - Median Reach Time: {sub['reach_time'].median():.0f} steps")
 
     print("="*60 + "\n")
-    
-def attach_macd_event_lifecycle_label(df, 
-                                interval_ms,
-                                para = BaseDefine,):
-    """
-    Strict time-aligned MACD event lifecycle labels (auto-detect feature column names).
-    min_threshold logic removed.
-    """
-    # --- 1. Auto-detect MACD feature column names ---
-    dif_cols = [c for c in df.columns if c.startswith('MACD_') and c.endswith('_DIF')]
-    dea_cols = [c for c in df.columns if c.startswith('MACD_') and c.endswith('_DEA')]
-    
-    if not dif_cols or not dea_cols:
-        raise ValueError("❌ MACD feature columns not found (expected suffixes: _DIF and _DEA)")
-    
-    dif_name = dif_cols[0]
-    prefix = dif_name.replace('_DIF', '')
-    dea_name = f"{prefix}_DEA"
-    
-    if dea_name not in df.columns:
-        raise ValueError(f"❌ Cannot find matching DEA column for {dif_name}: {dea_name}")
-
-    print(f"🔍 [MACD Match] Auto-detected feature columns: {dif_name} / {dea_name}")
-
-    time_col = 'open_time_ms_utc'
-    time_values = df[time_col].values
-    
-    # 2. Identify crossover points
-    dif = df[dif_name]
-    dea = df[dea_name]
-    cross_mask = (dif > dea) != (dif.shift(1) > dea.shift(1))
-    cross_mask.iloc[0] = False
-    event_indices = df.index[cross_mask].tolist()
-    
-    # 3. Initialize and compute dynamic thresholds
-    df['label'] = Signal.INVALID
-    df = calculate_thresholds(df, para)
-    
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    thresholds = df['threshold'].values
-    sl_thresholds = df['stop_threshold'].values
-
-    # 4. Iterate crossover events
-    for i in range(len(event_indices)):
-        curr_idx = event_indices[i]
-        if i + 1 >= len(event_indices):
-            df.at[curr_idx, 'label'] = Signal.INVALID
-            continue
-            
-        next_idx = event_indices[i+1]
-        
-        # --- Time alignment check ---
-        expected_gap_ms = (next_idx - curr_idx) * interval_ms
-        actual_gap_ms = time_values[next_idx] - time_values[curr_idx]
-        
-        if actual_gap_ms != expected_gap_ms:
-            df.at[curr_idx, 'label'] = Signal.INVALID
-            continue
-
-        # --- Business logic ---
-        is_long_event = dif.iloc[curr_idx] > dea.iloc[curr_idx]
-        entry_price = closes[curr_idx]
-        tp_target = thresholds[curr_idx]
-        sl_target = sl_thresholds[curr_idx]
-        
-        pnl_at_exit = (closes[next_idx] - entry_price) / entry_price if is_long_event else \
-                      (entry_price - closes[next_idx]) / entry_price
-        
-        window_highs = highs[curr_idx + 1 : next_idx + 1]
-        window_lows = lows[curr_idx + 1 : next_idx + 1]
-        
-        if is_long_event:
-            hit_stop = np.any(window_lows <= entry_price * (1 - sl_target))
-        else:
-            hit_stop = np.any(window_highs >= entry_price * (1 + sl_target))
-
-        if pnl_at_exit >= tp_target and not hit_stop:
-            df.at[curr_idx, 'label'] = Signal.POSITIVE  if is_long_event else Signal.NEGATIVE
-        else:
-            df.at[curr_idx, 'label'] = Signal.NEUTRAL
-
-    return df
-
-def attach_boll_event_lifecycle_label(df, 
-                                interval_ms,
-                                para = BaseDefine,):
-    """
-    Mean-reversion Bollinger Band lifecycle labels.
-    min_threshold logic removed.
-    """
-    upper_cols = [c for c in df.columns if c.startswith('BOLL_UPPER_')]
-    lower_cols = [c for c in df.columns if c.startswith('BOLL_LOWER_')]
-    middle_cols = [c for c in df.columns if c.startswith('BOLL_MIDDLE_')]
-    
-    if not (upper_cols and lower_cols and middle_cols):
-        raise ValueError("❌ Incomplete BOLL feature columns detected")
-    
-    u_name, l_name, m_name = upper_cols[0], lower_cols[0], middle_cols[0]
-    print(f"🔍 [BOLL Match] Auto-detected feature columns: {u_name}, {l_name}, {m_name}")
-
-    time_col = 'open_time_ms_utc'
-    time_values = df[time_col].values
-    
-    long_trigger = df['close'] < df[l_name]
-    short_trigger = df['close'] > df[u_name]
-    event_mask = long_trigger | short_trigger
-    event_indices = df.index[event_mask].tolist()
-    
-    # 3. Initialize and compute dynamic thresholds
-    df['label'] = Signal.INVALID
-    df = calculate_thresholds(df, para)
-    
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    middles = df[m_name].values
-    thresholds = df['threshold'].values
-    sl_thresholds = df['stop_threshold'].values
-
-    # 4. Iterate events
-    for curr_idx in event_indices:
-        is_long_event = long_trigger.iloc[curr_idx]
-        entry_price = closes[curr_idx]
-        tp_target = thresholds[curr_idx]
-        sl_limit = sl_thresholds[curr_idx]
-        
-        if is_long_event:
-            exit_candidates = np.where(closes[curr_idx + 1:] >= middles[curr_idx + 1:])[0]
-        else:
-            exit_candidates = np.where(closes[curr_idx + 1:] <= middles[curr_idx + 1:])[0]
-            
-        if len(exit_candidates) == 0:
-            df.at[curr_idx, 'label'] = Signal.INVALID
-            continue
-            
-        next_idx = curr_idx + 1 + exit_candidates[0]
-        
-        if (time_values[next_idx] - time_values[curr_idx]) != (next_idx - curr_idx) * interval_ms:
-            df.at[curr_idx, 'label'] = Signal.INVALID
-            continue
-
-        pnl_at_exit = (closes[next_idx] - entry_price) / entry_price if is_long_event else \
-                      (entry_price - closes[next_idx]) / entry_price
-        
-        window_highs = highs[curr_idx + 1 : next_idx + 1]
-        window_lows = lows[curr_idx + 1 : next_idx + 1]
-        
-        if is_long_event:
-            hit_stop = np.any(window_lows <= entry_price * (1 - sl_limit))
-        else:
-            hit_stop = np.any(window_highs >= entry_price * (1 + sl_limit))
-
-        if pnl_at_exit >= tp_target and not hit_stop:
-            df.at[curr_idx, 'label'] = Signal.POSITIVE  if is_long_event else Signal.NEGATIVE
-        else:
-            df.at[curr_idx, 'label'] = Signal.NEUTRAL
-
-    _boll_audit(df, event_indices)
-    return df
-
-def _boll_audit(df, event_indices):
-    total = len(event_indices)
-    stats = df.loc[event_indices, 'label'].value_counts()
-    print(f"\n📊 [BOLL Lifecycle Audit]")
-    print(f"  - Total triggers: {total}")
-    print(f"  - POSITIVE  (2) valid: {stats.get(Signal.POSITIVE , 0)} ({(stats.get(Signal.POSITIVE , 0)/total)*100:.2f}%)")
-    print(f"  - NEGATIVE (0) valid: {stats.get(Signal.NEGATIVE, 0)} ({(stats.get(Signal.NEGATIVE, 0)/total)*100:.2f}%)")
-    print(f"  - NEUTRAL (1) noise: {stats.get(Signal.NEUTRAL, 0)}")
-
-def attach_sma_7_25_crossover_label(df, 
-                                interval_ms,para = BaseDefine,):
-    """
-    SMA 7/25 crossover lifecycle labels.
-    min_threshold logic removed.
-    """
-    fast_ma_name = "SMA_7B"
-    slow_ma_name = "SMA_25B"
-    
-    if fast_ma_name not in df.columns or slow_ma_name not in df.columns:
-        raise ValueError(f"❌ SMA columns not found: {fast_ma_name} or {slow_ma_name}. Please check FeatureMA configuration.")
-
-    time_col = 'open_time_ms_utc'
-    time_values = df[time_col].values
-    
-    fast_ma = df[fast_ma_name]
-    slow_ma = df[slow_ma_name]
-    cross_mask = (fast_ma > slow_ma) != (fast_ma.shift(1) > slow_ma.shift(1))
-    cross_mask.iloc[0] = False
-    event_indices = df.index[cross_mask].tolist()
-    
-    df['label'] = Signal.INVALID 
-    df = calculate_thresholds(df, para)
-    
-    closes = df['close'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    thresholds = df['threshold'].values
-    sl_thresholds = df['stop_threshold'].values
-
-    for i in range(len(event_indices)):
-        curr_idx = event_indices[i]
-        if i + 1 >= len(event_indices):
-            continue
-            
-        next_idx = event_indices[i+1]
-        
-        expected_gap = (next_idx - curr_idx) * interval_ms
-        actual_gap = time_values[next_idx] - time_values[curr_idx]
-        
-        if actual_gap != expected_gap:
-            continue
-
-        is_long_event = fast_ma.iloc[curr_idx] > slow_ma.iloc[curr_idx]
-        entry_price = closes[curr_idx]
-        
-        pnl_rate = (closes[next_idx] - entry_price) / entry_price if is_long_event else \
-                   (entry_price - closes[next_idx]) / entry_price
-        
-        window_highs = highs[curr_idx + 1 : next_idx + 1]
-        window_lows = lows[curr_idx + 1 : next_idx + 1]
-        
-        sl_limit = sl_thresholds[curr_idx]
-        if is_long_event:
-            hit_stop = np.any(window_lows <= entry_price * (1 - sl_limit))
-        else:
-            hit_stop = np.any(window_highs >= entry_price * (1 + sl_limit))
-
-        if pnl_rate >= thresholds[curr_idx] and not hit_stop:
-            df.at[curr_idx, 'label'] = Signal.POSITIVE  if is_long_event else Signal.NEGATIVE
-        else:
-            df.at[curr_idx, 'label'] = Signal.NEUTRAL
-
-    return df
 
 
 def clean_data_quality_auto(df: pd.DataFrame, logger) -> pd.DataFrame:
@@ -852,23 +883,6 @@ def load_train_config(path, cls):
         data = json.load(f)
 
     return build_dataclass(cls, data["train"])
-
-def create_experiment_dir(base_dir, symbol, interval, now=None):
-    """
-    Create experiment directory:
-        base_dir / SYMBOL_INTERVAL / YYYY-MM-DD / HH_MM_SS
-    Returns the final experiment directory path.
-    """
-    now = now or datetime.now()
-
-    date_dir = now.strftime("%Y-%m-%d")
-    time_dir = now.strftime("%H_%M_%S")
-    sym_interval_dir = f"{symbol}_{interval}"
-
-    exp_dir = os.path.join(base_dir, sym_interval_dir,date_dir, time_dir)
-    os.makedirs(exp_dir, exist_ok=True)
-
-    return exp_dir
 
 def append_jsonl(path, obj):
     with open(path, "a", encoding="utf-8") as f:
