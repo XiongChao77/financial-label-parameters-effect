@@ -1,5 +1,7 @@
 import boto3
 from botocore.config import Config
+import os 
+current_work_dir = os.path.dirname(__file__) 
 
 # Initialize a session using your credentials
 session = boto3.Session(
@@ -25,20 +27,21 @@ paginator = s3.get_paginator('list_objects_v2')
 # - 'us_options_opra' for US options (OPRA) data
 # - 'us_stocks_sip' for US stocks (SIP) data
 prefix = 'us_stocks_sip'  # Example: Change this prefix to match your data need
-
+period = 'trades' # minutes
 # List objects using the selected prefix
 for page in paginator.paginate(Bucket='flatfiles', Prefix=prefix):
   for obj in page['Contents']:
-    if 'day' in obj['Key']:
+    if period in obj['Key'] and '2026':
         print(obj['Key'])
         
         object_key = obj['Key']
         local_file_name = object_key.split('/')[-1]
 
         # This constructs the full local file path
-        local_file_path = './massive/day/' + local_file_name
+        local_file_path = os.path.join(current_work_dir,'massive',period,local_file_name )
 
         # Download the file
         # Specify the bucket name
         bucket_name = 'flatfiles'
-        s3.download_file(bucket_name, object_key, local_file_path)
+        if not os.path.exists(local_file_path ):
+          s3.download_file(bucket_name, object_key, local_file_path)
