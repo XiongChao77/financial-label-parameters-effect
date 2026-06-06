@@ -15,4 +15,6 @@ data_process/data/*
 output*
 *keys*
 launch.json
-data_process/massive/*
+data_process/massive/data/*
+massive_key.json
+.vscode
