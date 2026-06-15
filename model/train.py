@@ -1680,13 +1680,16 @@ def run_fixed_neutral_subsampling_experiment(
         if test_target_n < strictest_test_target_n:
             strictest_test_target_n = test_target_n
             logger.info(f"New strictest test target n={strictest_test_target_n} found at column {col_name}")
-
+    # exit()
     for run_id in range(total_runs):
         logger.info(f"Starting run {run_id+1}/{total_runs}")
         t_seed = train_cfg.seed + run_id*10000
         experiment_datsets = prepare_parameter_regime_datasets(logger,t_seed, labels_matrix, train_idx, test_idx, label_cols,strictest_train_target_n,strictest_test_target_n)
 
-        for experiment_model in ['LSTM']: #['DecisionTree', 'LogisticRegression', 'LSTM']:
+        for experiment_model in ['DecisionTree', 'LogisticRegression', 'LSTM']:#['LSTM']: #
+            if 'd' in pre_para.interval and experiment_model == 'LSTM':
+                logger.info(f"skip LSTM on {pre_para.symbol}_{pre_para.interval}, since the dataset is insufficient to complete the training.")
+                continue
             #train
             for col_idx, col_name in enumerate(label_cols):
                 logger.info(f"{experiment_model} train {col_name}")
@@ -1716,6 +1719,7 @@ def run_fixed_neutral_subsampling_experiment(
                         max_iter=train_cfg.lr_max_iter,
                         C=train_cfg.lr_C,
                     )
+                    model.fit(X_tr_flat, y_tr)
                 elif experiment_model == 'DecisionTree':
                     model = DecisionTreeClassifier(
                         min_samples_leaf=max(20, int(0.01 * len(y_tr))),

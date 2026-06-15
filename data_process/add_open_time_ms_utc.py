@@ -2,7 +2,7 @@ import pandas as pd
 import os
 
 # 1. 定义文件路径
-file_path = "QuantData/Stock/massive/spot/QQQ_1m.csv"
+file_path = "QuantData/Stock/massive/spot/QQQ_1d.csv"
 
 # 确保文件存在
 if os.path.exists(file_path):

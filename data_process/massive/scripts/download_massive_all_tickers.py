@@ -262,7 +262,7 @@ if __name__ == "__main__":
 
     download_all_tickers(
         api_key=API_KEY,
-        output_csv=os.path.join(current_work_dir, "all_tickers.csv"),
+        output_csv=os.path.join(current_work_dir, 'data', "all_tickers.csv"),
         market="stocks",
         locale="us",
         active=None,       # 重要：None 表示 active 和 inactive 都下载

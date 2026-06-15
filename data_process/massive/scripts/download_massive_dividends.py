@@ -375,7 +375,7 @@ if __name__ == "__main__":
 
     download_all_dividends(
         api_key=API_KEY,
-        output_csv=os.path.join(current_work_dir,'all_stock_dividends.csv'),
+        output_csv=os.path.join(current_work_dir, 'data','all_stock_dividends.csv'),
         ex_dividend_date_gte=None,
         ex_dividend_date_lte=None,
         limit=5000,

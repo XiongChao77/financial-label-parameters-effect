@@ -67,7 +67,7 @@ paginator = s3.get_paginator('list_objects_v2')
 # - 'us_stocks_sip' for US stocks (SIP) data
 prefix = 'us_stocks_sip'  # Example: Change this prefix to match your data need
 period = 'minute' # day/minute /trades/quotes
-directory = os.path.join(current_work_dir,'massive',period)
+directory = os.path.join(current_work_dir,'massive', 'data',period)
 os.makedirs(directory,exist_ok=True)
 # List objects using the selected prefix
 for page in paginator.paginate(Bucket='flatfiles', Prefix=prefix):

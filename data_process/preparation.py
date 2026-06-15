@@ -9,19 +9,27 @@ sys.path.append(os.path.join(current_work_dir,'..'))
 from data_process import common
 
 def plot_label_distribution(df, interval_ms, para, label_function):
-    from data_process.regime_discovery import LabelRegimeAnalyzer
-    analyzer = LabelRegimeAnalyzer(df, interval_ms, para)
-    
-    # Define a finer grid to capture gradients
-    vol_range = np.arange(0.1, 5, 0.1).round(2)   #not include 3.1
-    stop_range = [np.inf]  #np.arange(100, 100.1, 0.1).round(1)   #not include 1.6
-    
-    analyzer.run_parameter_sweep(vol_range, stop_range, label_function)
-    # analyzer.analyze_and_plot()
-    analyzer.plot_vol_vs_distribution()
-    analyzer.plot_null_hypothesis_comparison()
-    analyzer.plot_long_ratio_vs_vol_multiplier()
-    analyzer.plot_distribution_for_stop_rate(
+    from data_process.plot_label_ratio_sweep import LabelRatioCurveAnalyzer
+
+    analyzer = LabelRatioCurveAnalyzer(df, interval_ms, para)
+
+    stop_range = [np.inf]
+
+    if para.para_type == 'volatility':
+        parameter_range = np.arange(0.1, 5, 0.1).round(2)
+    elif para.para_type == 'horizon':
+        parameter_range = np.arange(2, 80, 2).astype(int)
+    else:
+        raise ValueError(f"Unsupported para_type: {para.para_type}")
+
+    analyzer.run_parameter_sweep(
+        parameter_range=parameter_range,
+        stop_range=stop_range,
+        fun=label_function,
+        label_col='label',
+    )
+
+    analyzer.plot_all_label_ratio_curves(
         stop_rate=np.inf,
         smooth_window=3,
         include_gaussian=True,
@@ -86,7 +94,7 @@ def summary_statistics_stock(para, prep_output_dir, df, label_col, logger):
 
     logger.info(f"✅ 数据准备完成。配置文件已写入: {meta_path}")
 
-def summary_statistics(para,prep_output_dir,df, label_col, logger):
+def summary_statistics(para,prep_output_dir,df, logger):
     label_cols = [
         col for col in df.columns 
         if col.startswith('label_') and not any(sub in col for sub in ['index', 'id', 'exit', 'price', 'threshold', 'strength', 'stop'])
@@ -96,8 +104,6 @@ def summary_statistics(para,prep_output_dir,df, label_col, logger):
         # 此时剩下的全部是真正的标签列（如 label_3.5_3.5），再从中安全地寻找 0 最少的列
         label_col = min(label_cols, key=lambda c: int((df[c] == 0).sum()))
         logger.info(f"strictest label column is {label_col}")
-    else:
-        logger.warning("No valid columns starting with 'label_' found. Using the default passed label_col.")
 
     # ---------------- Summary statistics ----------------
     start_time = df['open_time_date_utc'].iloc[0]
@@ -164,7 +170,6 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
     # Feature engineering must explicitly handle volume==0 cases.
     df = common.clean_data_quality_auto(df,logger)
     # 3. Pass interval_ms to label logic so it can adapt its volatility window to the real time span.
-    label_col = 'label'
     if args.mode == 'plot':
         plot_label_distribution(df, interval_ms, para, common.attach_label)        # 4. Run analysis
 
@@ -177,6 +182,7 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
             - All columns Neutral  -> Signal.NEUTRAL (1)
             - Otherwise (mixed directions or trend-to-range transitions) -> Signal.INVALID (-1)
             """
+            label_col = 'label'
             label_cols = [c for c in df.columns if c.startswith(label_prefix)]
             if not label_cols:
                 return df
@@ -216,10 +222,10 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
                 df = common.attach_label(df, para=para, label_col=para_label)
         df = generate_strict_consensus_label(df)
         # ---------------- Summary statistics ----------------
-        summary_statistics(para, prep_output_dir, df, label_col, logger)
+        summary_statistics(para, prep_output_dir, df, logger)
     elif args.mode == 'label':
         df = common.attach_label(df, para=para, label_col=f'label')
-        summary_statistics(para, prep_output_dir, df, label_col, logger)
+        summary_statistics(para, prep_output_dir, df, logger)
     else:
         logger.warning("No action specified. Use --plot to visualize label distribution or --label to generate labels and summary statistics.")
 
@@ -235,15 +241,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger, _ = common.setup_session_logger(sub_folder='dissertation/data_process')
     
-    main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.5, 8, 0.5).round(1),predict_num=16) 
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(4, 80, 10), vol_multiplier = 4)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.5, 8, 0.5).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(2, 80, 10), vol_multiplier = 4)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_volatility, volatility_range= np.arange(0.5, 8, 0.5).round(1), predict_num = 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.5, 10, 0.1).round(1),predict_num=16) 
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier = 4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.5, 8, 0.1).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(2, 80, 2), vol_multiplier = 4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_volatility, volatility_range= np.arange(0.1, 6, 0.1).round(1), predict_num = 16)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_horizon, horizon_range= np.arange(2, 24, 2), vol_multiplier=3)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_volatility, volatility_range= np.arange(0.5, 6, 0.5), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_horizon, horizon_range= np.arange(2, 16, 4), vol_multiplier=4)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_volatility, volatility_range= np.arange(1, 4, 0.2).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_horizon, horizon_range= np.arange(4, 80, 2), vol_multiplier=2)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_volatility, volatility_range= np.arange(1, 3, 0.2).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_horizon, horizon_range= np.arange(4, 16, 2), vol_multiplier= 2)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_volatility, volatility_range= np.arange(0.1, 6, 0.1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_horizon, horizon_range= np.arange(2, 36, 2), vol_multiplier=4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_volatility, volatility_range= np.arange(0.1, 4, 0.1).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier=2)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_volatility, volatility_range= np.arange(0.5, 3, 0.1).round(1), predict_num= 16)
+    main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_horizon, horizon_range= np.arange(2, 16, 2), vol_multiplier= 2)

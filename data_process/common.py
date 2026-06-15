@@ -283,7 +283,6 @@ def attach_fthl_stock_minutely(df, para=BaseDefine(), label_col='label'):
     # 修改点 1：将 open_time_sn 改为严格连续的自增标注
     # 供下游特征处理模块校验输入序列（Lookback Window）的连续性
     # ---------------------------------------------------------
-    open_time_sn = np.arange(n, dtype=np.int64)
     df['open_time_sn'] = np.arange(n, dtype=np.int64)
 
     # ---------------------------------------------------------
@@ -585,13 +584,14 @@ def fast_triple_barrier_kernel(close, high, low, thresholds, window):
     return labels, reach_times
 
 def attach_tbm_label(df, para=BaseDefine(), label_col = 'label'):
+    interval_ms = get_interval_ms(para.interval)
     if para.market_category == "Stock":
         df['open_time_sn'] = np.arange(len(df), dtype=np.int64)
         if 'd' in para.interval:
             df = calculate_thresholds(df, para)
         elif 'm' in para.interval:
             df = calculate_us_stock_mins_thresholds(df, para)
-    elif para.market_category == "cryptocurrency":
+    elif para.market_category == "Cryptocurrency":
         df['open_time_sn'] = df['open_time_ms_utc']// interval_ms
         df = calculate_thresholds(df, para)
 
@@ -616,15 +616,19 @@ def attach_tbm_label(df, para=BaseDefine(), label_col = 'label'):
     df[label_col] = labels
     df['reach_time'] = reach_times
     
-    interval_ms = get_interval_ms(para.interval)
-    time_values = df['open_time_ms_utc'].values
-    target_times = time_values + (window * interval_ms)
-    target_indices = np.searchsorted(time_values, target_times, side='left')
-    
+    sn_values = df['open_time_sn'].values
+
+    target_sn = sn_values + window
+    target_indices = np.searchsorted(sn_values, target_sn, side='left')
+
     in_bounds = target_indices < len(df)
+
     time_match = np.zeros(len(df), dtype=np.bool_)
     valid_idx = np.where(in_bounds)[0]
-    time_match[valid_idx] = (time_values[target_indices[valid_idx]] == target_times[valid_idx])
+
+    time_match[valid_idx] = (
+        sn_values[target_indices[valid_idx]] == target_sn[valid_idx]
+    )
     
     df.loc[~time_match, label_col] = -1       # Signal.INVALID
     df.loc[~time_match, 'reach_time'] = -1  # 无效到达时间
@@ -705,12 +709,13 @@ def clean_data_quality_auto(df: pd.DataFrame, logger) -> pd.DataFrame:
     if na_rows > 0:
         logger.warning(f"Detected {na_rows} rows containing NaN values; dropping them.")
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    zero_mask = (df[numeric_cols] == 0).any(axis=1)
+    price_cols = ['open','close','high','low']
+    # price_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    zero_mask = (df[price_cols] == 0).any(axis=1)
     zero_rows = zero_mask.sum()
     
     if zero_rows > 0:
-        zero_stats = (df[numeric_cols] == 0).sum()
+        zero_stats = (df[price_cols] == 0).sum()
         logger.warning(f"Detected {zero_rows} rows containing zero values. Distribution:\n{zero_stats[zero_stats > 0]}")
 
     condition = df.isna().any(axis=1) | zero_mask

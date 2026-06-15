@@ -10,8 +10,8 @@ TARGET = "QQQ"
 TARGET_CANDIDATES = ["QQQ", "QQQQ"]
 
 period = 'day' # 'day'
-DATA_DIR = Path(os.path.join(current_work_dir, '..', period))
-SPLITS_PATH = Path(os.path.join(current_work_dir, '..', "massive_splits_all.csv"))
+DATA_DIR = Path(os.path.join(current_work_dir, '..', 'data', period))
+SPLITS_PATH = Path(os.path.join(current_work_dir, '..', 'data', "massive_splits_all.csv"))
 
 if period == 'minute':
     prefix = '1m'

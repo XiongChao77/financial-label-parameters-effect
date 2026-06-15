@@ -93,7 +93,7 @@ df = pd.DataFrame(all_rows)
 print(df.head())
 print(df.shape)
 
-massive_splits_all = os.path.join(current_work_dir,'massive_splits_all.csv')
+massive_splits_all = os.path.join(current_work_dir, 'data','massive_splits_all.csv')
 df.to_csv(massive_splits_all, index=False)
 
 print(f"Saved to: {massive_splits_all}")
