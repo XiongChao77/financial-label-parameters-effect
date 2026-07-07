@@ -27,7 +27,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import f1_score, matthews_corrcoef, balanced_accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score, balanced_accuracy_score, precision_recall_fscore_support
 from sklearn.exceptions import ConvergenceWarning
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -742,6 +742,13 @@ def compute_financial_returns_with_exit_index_vectorized(
 
     return results
 
+def generate_random_predictions(n: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.choice(
+        [common.Signal.POSITIVE,common.Signal.NEGATIVE,common.Signal.NEUTRAL,],
+        size=int(n),
+        replace=True,).astype(np.int64)
+
 def plot_cross_eval_heatmap(
     cross_df: pd.DataFrame,
     save_dir: str,
@@ -1063,7 +1070,7 @@ def plot_self_eval_mean_std(
 
         out_path = os.path.join(
             model_save_dir,
-            f"self_eval_{metric}_mean_std.png",
+            f"self_eval_{metric}.png",
         )
 
         plt.savefig(out_path, dpi=250)
@@ -1077,23 +1084,21 @@ def plot_financial_return_mean_std(
     financial_summary_df: pd.DataFrame,
     save_dir: str,
     metric: str,
-    para_type:str = "volatility",
+    para_type: str = "volatility",
 ) -> list[str]:
     """
     Plot threshold-financial metric mean/std curves.
 
-    Expected columns:
-        model
-        fee_rate
-        threshold
-        {metric}_mean
-        {metric}_std
-        n_runs
-        test_size
+    Real models:
+        - plot mean curve
+        - plot ±1 std band
 
-    Example metrics:
-        strategy_total_return
-        signal_avg_return
+    RandomPredict:
+        - used only as baseline
+        - overlaid on each real model figure
+        - plot mean curve only
+        - no std band
+        - no separate RandomPredict figure
     """
 
     mean_col = f"{metric}_mean"
@@ -1115,7 +1120,16 @@ def plot_financial_return_mean_std(
 
     out_paths = []
 
-    for (model_name, fee_rate), df_one in financial_summary_df.groupby(
+    # Split RandomPredict from real models.
+    random_df = financial_summary_df[
+        financial_summary_df["model"] == "RandomPredict"
+    ].copy()
+
+    real_df = financial_summary_df[
+        financial_summary_df["model"] != "RandomPredict"
+    ].copy()
+
+    for (model_name, fee_rate), df_one in real_df.groupby(
         ["model", "fee_rate"],
         dropna=False,
     ):
@@ -1142,12 +1156,15 @@ def plot_financial_return_mean_std(
 
         plt.figure(figsize=(10, 6))
 
+        # =====================================================
+        # Real model: mean + std
+        # =====================================================
         plt.plot(
             x,
             y,
             marker="o",
             linewidth=2,
-            label=f"{metric} mean",
+            label=f"{model_name} {metric} mean",
         )
 
         plt.fill_between(
@@ -1155,11 +1172,30 @@ def plot_financial_return_mean_std(
             y - y_std,
             y + y_std,
             alpha=0.2,
-            label="±1 std across runs",
+            label=f"{model_name} ±1 std",
         )
 
-        # Mark best point.
-        # 对收益类指标，越大越好；如果全是 nan，则跳过标注。
+        # =====================================================
+        # RandomPredict baseline: mean only, no std
+        # =====================================================
+        random_one = random_df[
+            random_df["fee_rate"] == fee_rate
+        ].sort_values("threshold")
+
+        if len(random_one) > 0:
+            x_random = random_one["threshold"].to_numpy(dtype=float)
+            y_random = random_one[mean_col].to_numpy(dtype=float)
+
+            plt.plot(
+                x_random,
+                y_random,
+                marker="x",
+                linewidth=2,
+                linestyle="--",
+                label="RandomPredict baseline mean",
+            )
+
+        # Mark best point of the real model only.
         if np.any(np.isfinite(y)):
             best_i = int(np.nanargmax(y))
 
@@ -1186,12 +1222,12 @@ def plot_financial_return_mean_std(
             f"Model={model_name}, Fee={fee_rate:.6f}"
         )
 
-        if para_type == 'volatility':
+        if para_type == "volatility":
             plt.xlabel("Label Threshold Multiplier λ")
-        elif para_type == 'horizon':
+        elif para_type == "horizon":
             plt.xlabel("Label bar horizon h")
-        plt.ylabel(metric)
 
+        plt.ylabel(metric)
         plt.grid(True, alpha=0.3)
 
         handles, _ = plt.gca().get_legend_handles_labels()
@@ -1203,6 +1239,159 @@ def plot_financial_return_mean_std(
         out_path = os.path.join(
             model_save_dir,
             f"financial_{metric}_fee_{fee_rate:.6f}.png",
+        )
+
+        plt.savefig(out_path, dpi=250)
+        plt.close()
+
+        out_paths.append(out_path)
+
+    return out_paths
+
+def plot_financial_three_means(
+    financial_summary_df: pd.DataFrame,
+    save_dir: str,
+    para_type: str = "volatility",
+    random_metric: str = "strategy_total_return_mean",
+) -> list[str]:
+    """
+    Financial three-in-one plot.
+
+    For each real model + fee_rate, generate one figure with:
+    1) signal_avg_return_mean
+    2) strategy_total_return_mean
+    3) RandomPredict baseline mean
+
+    random_metric:
+        - "strategy_total_return_mean"  -> use RandomPredict strategy mean
+        - "signal_avg_return_mean"      -> use RandomPredict signal mean
+    """
+
+    required_cols = [
+        "model",
+        "fee_rate",
+        "threshold",
+        "n_runs",
+        "test_size",
+        "signal_avg_return_mean",
+        "strategy_total_return_mean",
+    ]
+
+    missing = [c for c in required_cols if c not in financial_summary_df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns for financial three-metric plot: {missing}")
+
+    if random_metric not in ["strategy_total_return_mean", "signal_avg_return_mean"]:
+        raise ValueError(
+            f"Unsupported random_metric={random_metric}. "
+            f"Expected 'strategy_total_return_mean' or 'signal_avg_return_mean'."
+        )
+
+    out_paths = []
+
+    random_df = financial_summary_df[
+        financial_summary_df["model"] == "RandomPredict"
+    ].copy()
+
+    real_df = financial_summary_df[
+        financial_summary_df["model"] != "RandomPredict"
+    ].copy()
+
+    for (model_name, fee_rate), df_one in real_df.groupby(
+        ["model", "fee_rate"],
+        dropna=False,
+    ):
+        model_save_dir = os.path.join(save_dir, str(model_name), "financial_return")
+        os.makedirs(model_save_dir, exist_ok=True)
+
+        df_plot = df_one.sort_values("threshold").copy()
+
+        if len(df_plot) == 0:
+            continue
+
+        x = df_plot["threshold"].to_numpy(dtype=float)
+        y_signal = df_plot["signal_avg_return_mean"].to_numpy(dtype=float)
+        y_strategy = df_plot["strategy_total_return_mean"].to_numpy(dtype=float)
+
+        test_size = int(df_plot["test_size"].iloc[0])
+        n_runs = int(df_plot["n_runs"].max())
+
+        info = (
+            f"{n_runs} independent runs\n"
+            f"test samples = {test_size}\n"
+            f"fee_rate = {fee_rate:.6f}"
+        )
+
+        plt.figure(figsize=(10, 6))
+
+        # 1) real model signal mean
+        plt.plot(
+            x,
+            y_signal,
+            marker="o",
+            linewidth=2,
+            label="Signal avg return mean",
+        )
+
+        # 2) real model strategy mean
+        plt.plot(
+            x,
+            y_strategy,
+            marker="s",
+            linewidth=2,
+            label="Strategy total return mean",
+        )
+
+        # 3) random baseline mean
+        random_one = random_df[
+            random_df["fee_rate"] == fee_rate
+        ].sort_values("threshold")
+
+        if len(random_one) > 0 and random_metric in random_one.columns:
+            x_random = random_one["threshold"].to_numpy(dtype=float)
+            y_random = random_one[random_metric].to_numpy(dtype=float)
+
+            random_label = (
+                "RandomPredict strategy mean"
+                if random_metric == "strategy_total_return_mean"
+                else "RandomPredict signal mean"
+            )
+
+            plt.plot(
+                x_random,
+                y_random,
+                marker="x",
+                linewidth=2,
+                linestyle="--",
+                label=random_label,
+            )
+
+        plt.axhline(0.0, linestyle="--", linewidth=1, alpha=0.6)
+
+        plt.title(
+            f"Financial Summary: Signal / Strategy / Random\n"
+            f"Model={model_name}, Fee={fee_rate:.6f}"
+        )
+
+        if para_type == "volatility":
+            plt.xlabel("Label Threshold Multiplier λ")
+        elif para_type == "horizon":
+            plt.xlabel("Label bar horizon h")
+        else:
+            plt.xlabel("Label parameter")
+
+        plt.ylabel("Return")
+        plt.grid(True, alpha=0.3)
+
+        handles, _ = plt.gca().get_legend_handles_labels()
+        handles.append(Line2D([], [], linestyle="none", label=info))
+        plt.legend(handles=handles, loc="best", framealpha=0.9)
+
+        plt.tight_layout()
+
+        out_path = os.path.join(
+            model_save_dir,
+            f"financial_three_means_fee_{fee_rate:.6f}.png",
         )
 
         plt.savefig(out_path, dpi=250)
@@ -1460,6 +1649,291 @@ def plot_train_vs_eval_summary(cross_train_batch_summary_df,cross_eval_batch_sum
         )
         plt.close(fig)
 
+def plot_self_eval_three_metrics(
+    self_summary_df: pd.DataFrame,
+    save_dir: str,
+    para_type: str = "volatility",
+) -> list[str]:
+    """
+    Self evaluation three-metric plot:
+    accuracy / macro_f1 / mcc in one figure.
+
+    Use mean curves only.
+    Existing single-metric mean±std figures are kept unchanged.
+    """
+
+    metrics = [
+        ("accuracy", "Accuracy"),
+        ("macro_f1", "Macro-F1"),
+        ("mcc", "MCC"),
+    ]
+
+    out_paths = []
+
+    for model_name, df_one in self_summary_df.groupby("model", dropna=False):
+        model_save_dir = os.path.join(save_dir, str(model_name))
+        os.makedirs(model_save_dir, exist_ok=True)
+
+        df_plot = df_one.sort_values("threshold").copy()
+
+        if len(df_plot) == 0:
+            continue
+
+        x = df_plot["threshold"].to_numpy(dtype=float)
+
+        plt.figure(figsize=(10, 6))
+
+        for metric, label in metrics:
+            mean_col = f"{metric}_mean"
+
+            if mean_col not in df_plot.columns:
+                continue
+
+            y = df_plot[mean_col].to_numpy(dtype=float)
+
+            plt.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=2,
+                label=label,
+            )
+
+        if para_type == "volatility":
+            xlabel = "Label Threshold Multiplier λ"
+        elif para_type == "horizon":
+            xlabel = "Label bar horizon h"
+        else:
+            xlabel = "Label parameter"
+
+        train_size = int(df_plot["train_size"].iloc[0])
+        test_size = int(df_plot["test_size"].iloc[0])
+        n_runs = int(df_plot["n_runs"].max())
+
+        info = (
+            f"{n_runs} independent runs\n"
+            f"train samples = {train_size}\n"
+            f"test samples = {test_size}"
+        )
+
+        plt.title(
+            f"Self Evaluation: Accuracy / Macro-F1 / MCC\n"
+            f"Model={model_name}"
+        )
+        plt.xlabel(xlabel)
+        plt.ylabel("Metric value")
+        plt.grid(True, alpha=0.3)
+
+        handles, _ = plt.gca().get_legend_handles_labels()
+        handles.append(Line2D([], [], linestyle="none", label=info))
+        plt.legend(handles=handles, loc="best", framealpha=0.9)
+
+        plt.tight_layout()
+
+        out_path = os.path.join(
+            model_save_dir,
+            "self_eval_three_metrics.png",
+        )
+
+        plt.savefig(out_path, dpi=250)
+        plt.close()
+
+        out_paths.append(out_path)
+
+    return out_paths
+
+def plot_cross_train_three_metrics(
+    cross_train_batch_summary_df: pd.DataFrame,
+    save_dir: str,
+    total_runs: int,
+    para_type: str = "volatility",
+) -> list[str]:
+    """
+    Cross-train three-metric plot:
+    accuracy / macro_f1 / mcc in one figure.
+
+    One figure for each model + eval_mode.
+    eval_mode naturally distinguishes raw / balanced.
+    """
+
+    metrics = [
+        ("accuracy", "Accuracy"),
+        ("macro_f1", "Macro-F1"),
+        ("mcc", "MCC"),
+    ]
+
+    out_paths = []
+
+    for (model, eval_mode), df_one in cross_train_batch_summary_df.groupby(
+        ["model", "eval_mode"],
+        dropna=False,
+    ):
+        model_save_dir = os.path.join(save_dir, str(model))
+        os.makedirs(model_save_dir, exist_ok=True)
+
+        df_plot = df_one.sort_values("train_threshold").copy()
+
+        if len(df_plot) == 0:
+            continue
+
+        x = df_plot["train_threshold"].to_numpy(dtype=float)
+
+        plt.figure(figsize=(10, 6))
+
+        for metric, label in metrics:
+            mean_col = f"{metric}_mean_mean"
+
+            if mean_col not in df_plot.columns:
+                continue
+
+            y = df_plot[mean_col].to_numpy(dtype=float)
+
+            plt.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=2,
+                label=label,
+            )
+
+        if para_type == "volatility":
+            xlabel = "Label Train Threshold Multiplier λ"
+        elif para_type == "horizon":
+            xlabel = "Label Train bar horizon h"
+        else:
+            xlabel = "Train label parameter"
+
+        train_size = int(df_plot["train_size"].iloc[0])
+        test_size = int(df_plot["test_size"].iloc[0])
+
+        info = (
+            f"{total_runs} independent runs\n"
+            f"train samples = {train_size}\n"
+            f"test samples = {test_size}"
+        )
+
+        plt.title(
+            f"Cross Train Summary: Accuracy / Macro-F1 / MCC\n"
+            f"Model={model}, Eval={eval_mode}"
+        )
+        plt.xlabel(xlabel)
+        plt.ylabel("Metric value")
+        plt.grid(True, alpha=0.3)
+
+        handles, _ = plt.gca().get_legend_handles_labels()
+        handles.append(Line2D([], [], linestyle="none", label=info))
+        plt.legend(handles=handles, loc="best", framealpha=0.9)
+
+        plt.tight_layout()
+
+        out_path = os.path.join(
+            model_save_dir,
+            f"cross_train_three_metrics_{eval_mode}.png",
+        )
+
+        plt.savefig(out_path, dpi=250)
+        plt.close()
+
+        out_paths.append(out_path)
+
+    return out_paths
+
+def plot_cross_eval_three_metrics(
+    cross_eval_batch_summary_df: pd.DataFrame,
+    save_dir: str,
+    total_runs: int,
+    para_type: str = "volatility",
+) -> list[str]:
+    """
+    Cross-eval three-metric plot:
+    accuracy / macro_f1 / mcc in one figure.
+
+    One figure for each model + eval_mode.
+    eval_mode naturally distinguishes raw / balanced.
+    """
+
+    metrics = [
+        ("accuracy", "Accuracy"),
+        ("macro_f1", "Macro-F1"),
+        ("mcc", "MCC"),
+    ]
+
+    out_paths = []
+
+    for (model, eval_mode), df_one in cross_eval_batch_summary_df.groupby(
+        ["model", "eval_mode"],
+        dropna=False,
+    ):
+        model_save_dir = os.path.join(save_dir, str(model))
+        os.makedirs(model_save_dir, exist_ok=True)
+
+        df_plot = df_one.sort_values("eval_threshold").copy()
+
+        if len(df_plot) == 0:
+            continue
+
+        x = df_plot["eval_threshold"].to_numpy(dtype=float)
+
+        plt.figure(figsize=(10, 6))
+
+        for metric, label in metrics:
+            mean_col = f"{metric}_mean_mean"
+
+            if mean_col not in df_plot.columns:
+                continue
+
+            y = df_plot[mean_col].to_numpy(dtype=float)
+
+            plt.plot(
+                x,
+                y,
+                marker="o",
+                linewidth=2,
+                label=label,
+            )
+
+        if para_type == "volatility":
+            xlabel = "Label Eval Threshold Multiplier λ"
+        elif para_type == "horizon":
+            xlabel = "Label Eval bar horizon h"
+        else:
+            xlabel = "Eval label parameter"
+
+        train_size = int(df_plot["train_size"].iloc[0])
+        test_size = int(df_plot["test_size"].iloc[0])
+
+        info = (
+            f"{total_runs} independent runs\n"
+            f"train samples = {train_size}\n"
+            f"test samples = {test_size}"
+        )
+
+        plt.title(
+            f"Cross Eval Summary: Accuracy / Macro-F1 / MCC\n"
+            f"Model={model}, Eval={eval_mode}"
+        )
+        plt.xlabel(xlabel)
+        plt.ylabel("Metric value")
+        plt.grid(True, alpha=0.3)
+
+        handles, _ = plt.gca().get_legend_handles_labels()
+        handles.append(Line2D([], [], linestyle="none", label=info))
+        plt.legend(handles=handles, loc="best", framealpha=0.9)
+
+        plt.tight_layout()
+
+        out_path = os.path.join(
+            model_save_dir,
+            f"cross_eval_three_metrics_{eval_mode}.png",
+        )
+
+        plt.savefig(out_path, dpi=250)
+        plt.close()
+
+        out_paths.append(out_path)
+
+    return out_paths
+
 def summarize_cross_row_mean(
     cross_eval_df: pd.DataFrame,
     metric: str = "macro_f1",
@@ -1484,34 +1958,38 @@ def summarize_cross_row_mean(
     )
     return row_summary
 
-def prepare_parameter_regime_datasets(logger: logging.Logger, seed, labels_matrix, train_idx, test_idx, label_cols,strictest_train_target_n, strictest_test_target_n):
-    experiment_datsets:dict[str,dict] = {}
-    #get minimum size of POS/NEG for the strictest threshold
-    y_strictest = labels_matrix[:, len(label_cols)-1].astype(np.int64)
+def prepare_parameter_regime_datasets(
+    logger: logging.Logger, seed, labels_matrix,
+    train_idx, val_idx, test_idx, label_cols,
+    strictest_train_target_n, strictest_val_target_n, strictest_test_target_n,
+):
+    experiment_datsets: dict[str, dict] = {}
     train_target_n = strictest_train_target_n
+    val_target_n = strictest_val_target_n
     test_target_n = strictest_test_target_n
-    logger.warning("strictest label column is %s, with train target n=%d and test target n=%d", label_cols[-1], train_target_n, test_target_n)
+    logger.warning(
+        "strictest label column is %s, with train target n=%d, val target n=%d, test target n=%d",
+        label_cols[-1], train_target_n, val_target_n, test_target_n,
+    )
 
     for col_idx, col_name in enumerate(label_cols):
         y_all = labels_matrix[:, col_idx].astype(np.int64)
 
         balanced_train_idx = sample_balanced_indices_downsample(
-            logger,
-            y=y_all,
-            candidate_idx=train_idx,
-            size=train_target_n,
-            seed=seed + 10000 + col_idx*100,
+            logger, y=y_all, candidate_idx=train_idx,
+            size=train_target_n, seed=seed + 10000 + col_idx * 100,
         )
-
+        balanced_val_idx = sample_balanced_indices_downsample(
+            logger, y=y_all, candidate_idx=val_idx,
+            size=val_target_n, seed=seed + 10000 + col_idx * 100 + 2,
+        )
         balanced_test_idx = sample_balanced_indices_downsample(
-            logger,
-            y=y_all,
-            candidate_idx=test_idx,
-            size=test_target_n,
-            seed=seed + 10000 + col_idx*100 + 1,
+            logger, y=y_all, candidate_idx=test_idx,
+            size=test_target_n, seed=seed + 10000 + col_idx * 100 + 1,
         )
         experiment_datsets[col_name] = {
             "balanced_train_idx": balanced_train_idx,
+            "balanced_val_idx": balanced_val_idx,
             "balanced_test_idx": balanced_test_idx,
         }
     return experiment_datsets
@@ -1519,6 +1997,8 @@ def prepare_parameter_regime_datasets(logger: logging.Logger, seed, labels_matri
 def train_lstm_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     seed: int,
     num_classes: int = 3,
     epochs: int = 20,
@@ -1527,24 +2007,22 @@ def train_lstm_model(
     hidden_size: int = 64,
     num_layers: int = 2,
     dropout: float = 0.2,
+    patience: int = 5,
+    min_delta: float = 1e-4,
+    logger: logging.Logger = None,
 ):
     set_seed(seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.long)
-
     train_ds = TensorDataset(X_train_t, y_train_t)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+    y_val_t = torch.tensor(y_val, dtype=torch.long).to(device)
 
     input_size = X_train.shape[2]
-
     model = lstm.LSTMClassifier(
         input_size=input_size,
         hidden_size=hidden_size,
@@ -1556,26 +2034,53 @@ def train_lstm_model(
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    model.train()
+    best_val_loss = float("inf")
+    best_state = None
+    best_epoch = -1
+    epochs_no_improve = 0
 
     for epoch in range(epochs):
+        model.train()
         total_loss = 0.0
-
         for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-
+            xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
-
             logits = model(xb)
             loss = criterion(logits, yb)
-
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item() * xb.size(0)
+        train_loss = total_loss / len(train_ds)
 
-        avg_loss = total_loss / len(train_ds)
+        # ---- validation ----
+        model.eval()
+        with torch.no_grad():
+            val_logits = model(X_val_t)
+            val_loss = criterion(val_logits, y_val_t).item()
+            val_pred = torch.argmax(val_logits, dim=1).cpu().numpy()
+        val_f1 = f1_score(y_val, val_pred, average="macro")
+
+        if logger is not None:
+            logger.info(
+                f"[LSTM] epoch={epoch+1}/{epochs} train_loss={train_loss:.4f} "
+                f"val_loss={val_loss:.4f} val_macro_f1={val_f1:.4f}"
+            )
+
+        # ---- early stopping on val_loss ----
+        if val_loss < best_val_loss - min_delta:
+            best_val_loss = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                if logger is not None:
+                    logger.info(f"[LSTM] early stopping at epoch={epoch+1}, best_epoch={best_epoch+1}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     return model
 
@@ -1619,7 +2124,7 @@ def run_fixed_neutral_subsampling_experiment(
 
     df = common.load_train_df_from_dir(prep_output_dir)
     if pre_para is None:
-        pre_para = common.load_interval_ms_from_dir(prep_output_dir)
+        pre_para = common.load_pre_params_from_dir(prep_output_dir)
         logger.info(f"load pre_para from {prep_output_dir}")
     save_dir = os.path.join(save_dir, f"{pre_para.symbol}_{pre_para.interval}",pre_para.label_type,pre_para.para_type)
     os.makedirs(save_dir, exist_ok=True)
@@ -1646,7 +2151,7 @@ def run_fixed_neutral_subsampling_experiment(
         window=train_cfg.seq_len,
         stride=train_cfg.stride,
         use_cache=False,
-        show_feature_distribution=False,
+        show_feature_distribution=True,
     )
 
     window_indices = master_ds.indices
@@ -1657,11 +2162,12 @@ def run_fixed_neutral_subsampling_experiment(
     M = X_full.shape[0]
     X_full_flat = X_full.reshape(M, -1)
 
-    tr_rng, _, te_rng = chrono_split_by_window_ends(M, data_cfg.train_ratio, data_cfg.val_ratio)
+    tr_rng, va_rng, te_rng = chrono_split_by_window_ends(M, data_cfg.train_ratio, data_cfg.val_ratio)
     train_idx = np.arange(tr_rng[0], tr_rng[1])
-    test_idx = np.arange(te_rng[0], te_rng[1])
+    val_idx   = np.arange(va_rng[0], va_rng[1])
+    test_idx  = np.arange(te_rng[0], te_rng[1])
 
-    logger.info(f"Master windows M={M} | train={len(train_idx)} | test={len(test_idx)}")
+    logger.info(f"Master windows M={M} | train={len(train_idx)} | val={len(val_idx)} | test={len(test_idx)}")
 
     self_eval_rows = []
     cross_eval_rows = []
@@ -1669,14 +2175,19 @@ def run_fixed_neutral_subsampling_experiment(
     total_runs = 20
 
     strictest_train_target_n = np.inf
+    strictest_val_target_n = np.inf
     strictest_test_target_n = np.inf
     for col_idx, col_name in enumerate(label_cols):
         y_all = labels_matrix[:, col_idx].astype(np.int64)
-        _,_,_,train_target_n = compute_minimum_size(y_all,train_idx)
-        _,_,_,test_target_n = compute_minimum_size(y_all,test_idx)
+        _, _, _, train_target_n = compute_minimum_size(y_all, train_idx)
+        _, _, _, val_target_n   = compute_minimum_size(y_all, val_idx)
+        _, _, _, test_target_n  = compute_minimum_size(y_all, test_idx)
         if train_target_n < strictest_train_target_n:
             strictest_train_target_n = train_target_n
             logger.info(f"New strictest train target n={strictest_train_target_n} found at column {col_name}")
+        if val_target_n < strictest_val_target_n:
+            strictest_val_target_n = val_target_n
+            logger.info(f"New strictest val target n={strictest_val_target_n} found at column {col_name}")
         if test_target_n < strictest_test_target_n:
             strictest_test_target_n = test_target_n
             logger.info(f"New strictest test target n={strictest_test_target_n} found at column {col_name}")
@@ -1684,8 +2195,13 @@ def run_fixed_neutral_subsampling_experiment(
     for run_id in range(total_runs):
         logger.info(f"Starting run {run_id+1}/{total_runs}")
         t_seed = train_cfg.seed + run_id*10000
-        experiment_datsets = prepare_parameter_regime_datasets(logger,t_seed, labels_matrix, train_idx, test_idx, label_cols,strictest_train_target_n,strictest_test_target_n)
-
+        experiment_datsets = prepare_parameter_regime_datasets(
+            logger, t_seed, labels_matrix,
+            train_idx, val_idx, test_idx, label_cols,
+            strictest_train_target_n, strictest_val_target_n, strictest_test_target_n,
+        )
+        random_baseline_done = set()
+        
         for experiment_model in ['DecisionTree', 'LogisticRegression', 'LSTM']:#['LSTM']: #
             if 'd' in pre_para.interval and experiment_model == 'LSTM':
                 logger.info(f"skip LSTM on {pre_para.symbol}_{pre_para.interval}, since the dataset is insufficient to complete the training.")
@@ -1727,9 +2243,14 @@ def run_fixed_neutral_subsampling_experiment(
                         random_state=t_seed)
                     model.fit(X_tr_flat, y_tr)
                 elif experiment_model == 'LSTM':
+                    val_index = experiment_datsets[col_name]["balanced_val_idx"]
+                    X_val_seq = X_full[val_index]
+                    y_val = y_all[val_index]
                     model = train_lstm_model(
                         X_train=X_tr_seq,
                         y_train=y_tr,
+                        X_val=X_val_seq,
+                        y_val=y_val,
                         seed=t_seed,
                         num_classes=3,
                         epochs=20,
@@ -1738,6 +2259,8 @@ def run_fixed_neutral_subsampling_experiment(
                         hidden_size=64,
                         num_layers=2,
                         dropout=0.2,
+                        patience=5,
+                        logger=logger,
                     )
                 
                 # Within-Regime Evaluation: balanced test set
@@ -1751,7 +2274,7 @@ def run_fixed_neutral_subsampling_experiment(
                     y_pred_bal = model.predict(X_te_bal)
                 f1_bal = float(f1_score(y_te_bal, y_pred_bal, average="macro"))
                 mcc_bal = float(matthews_corrcoef(y_te_bal, y_pred_bal))
-                bal_acc = float(balanced_accuracy_score(y_te_bal, y_pred_bal))
+                acc = float(accuracy_score(y_te_bal, y_pred_bal))
                 class_labels = [common.Signal.POSITIVE, common.Signal.NEGATIVE, common.Signal.NEUTRAL]
                 p_class, r_class, f_class, _ = precision_recall_fscore_support(
                     y_te_bal, y_pred_bal, labels=class_labels, zero_division=0
@@ -1775,7 +2298,7 @@ def run_fixed_neutral_subsampling_experiment(
                         "threshold": threshold,
                         "macro_f1": f1_bal,
                         "mcc": mcc_bal,
-                        "balanced_accuracy": bal_acc,
+                        "accuracy": acc,
                         "p_pos": p_class[0], "r_pos": r_class[0], "f_pos": f_class[0],
                         "p_neg": p_class[1], "r_neg": r_class[1], "f_neg": f_class[1],
                         "p_neu": p_class[2], "r_neu": r_class[2], "f_neu": f_class[2],
@@ -1813,6 +2336,7 @@ def run_fixed_neutral_subsampling_experiment(
 
                         f1_cross = float(f1_score(y_te_bal, y_pred_cross , average="macro"))
                         mcc_bal = float(matthews_corrcoef(y_te_bal, y_pred_cross))
+                        acc_cross = float(accuracy_score(y_te_bal, y_pred_cross))
 
                         cross_eval_rows.append(
                             {
@@ -1826,11 +2350,58 @@ def run_fixed_neutral_subsampling_experiment(
                                 "eval_threshold": eval_threshold,
                                 "macro_f1": f1_cross,
                                 "mcc": mcc_bal,
+                                "accuracy": acc_cross,
                                 "test_size": int(len(y_te_bal)),
                             }
                         )
                 #financial return backtest
 
+                # =====================================================
+                # RandomPredict financial baseline
+                # Compute only once for each run + label column.
+                # =====================================================
+                if col_name not in random_baseline_done:
+                    y_random_pred = generate_random_predictions(
+                        n=len(test_idx),
+                        seed=t_seed + 900000 + col_idx,
+                    )
+
+                    begin_time = time.time()
+
+                    random_financial_metrics = compute_financial_returns(
+                        df=df,
+                        pre_para=pre_para,
+                        para_horizon=para_horizon,
+                        window_indices=window_indices,
+                        sample_idx=test_idx,
+                        y_pred=y_random_pred,
+                        label_col=col_name,
+                        initial_cash=10000.0,
+                        fee_rates=[0.0, 0.0005],
+                        price_col="close",
+                    )
+
+                    end_time = time.time()
+                    logger.info(
+                        f"compute RandomPredict financial_returns for {col_name} "
+                        f"takes time: {(end_time - begin_time):.2f} seconds"
+                    )
+
+                    for fm in random_financial_metrics:
+                        financial_metrics_list.append(
+                            {
+                                "run_id": run_id,
+                                "model": "RandomPredict",
+                                "eval_mode": "raw_test",
+                                "label_name": col_name,
+                                "threshold": threshold,
+                                "test_size": int(len(test_idx)),
+                                **fm,
+                            }
+                        )
+
+                    random_baseline_done.add(col_name)
+                    
                 if experiment_model == 'LSTM':
                     X_test = X_full[test_idx]
                     y_test_pred = predict_lstm_model(model, X_test)
@@ -1874,8 +2445,8 @@ def run_fixed_neutral_subsampling_experiment(
             macro_f1_std=("macro_f1", "std"),
             mcc_mean=("mcc", "mean"),
             mcc_std=("mcc", "std"),
-            balanced_accuracy_mean=("balanced_accuracy", "mean"),
-            balanced_accuracy_std=("balanced_accuracy", "std"),
+            accuracy_mean=("accuracy", "mean"),
+            accuracy_std=("accuracy", "std"),
             n_runs=("run_id", "nunique"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
@@ -1886,6 +2457,7 @@ def run_fixed_neutral_subsampling_experiment(
     cross_train_summary_df = (cross_eval_df.groupby(["run_id", "model", "eval_mode", "train_threshold"]).agg(
             macro_f1_mean=("macro_f1", "mean"),
             mcc_mean=("mcc", "mean"),
+            accuracy_mean=("accuracy", "mean"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -1896,6 +2468,8 @@ def run_fixed_neutral_subsampling_experiment(
             macro_f1_mean_std=("macro_f1_mean", "std"),
             mcc_mean_mean=("mcc_mean", "mean"),
             mcc_mean_std=("mcc_mean", "std"),
+            accuracy_mean_mean=("accuracy_mean", "mean"),
+            accuracy_mean_std=("accuracy_mean", "std"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -1904,6 +2478,7 @@ def run_fixed_neutral_subsampling_experiment(
     cross_eval_summary_df = (cross_eval_df.groupby(["run_id", "model", "eval_mode", "eval_threshold"]).agg(
             macro_f1_mean=("macro_f1", "mean"),
             mcc_mean=("mcc", "mean"),
+            accuracy_mean=("accuracy", "mean"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -1914,6 +2489,8 @@ def run_fixed_neutral_subsampling_experiment(
             macro_f1_mean_std=("macro_f1_mean", "std"),
             mcc_mean_mean=("mcc_mean", "mean"),
             mcc_mean_std=("mcc_mean", "std"),
+            accuracy_mean_mean=("accuracy_mean", "mean"),
+            accuracy_mean_std=("accuracy_mean", "std"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -1928,6 +2505,8 @@ def run_fixed_neutral_subsampling_experiment(
             macro_f1_std=("macro_f1", "std"),
             mcc_mean=("mcc", "mean"),
             mcc_std=("mcc", "std"),
+            accuracy_mean=("accuracy", "mean"),
+            accuracy_std=("accuracy", "std"),
             n_runs=("run_id", "nunique"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
@@ -2004,31 +2583,30 @@ def run_fixed_neutral_subsampling_experiment(
     )
 
     plot_self_eval_mean_std(self_summary_df, save_dir, metric="macro_f1", para_type = pre_para.para_type)
-    plot_self_eval_mean_std(self_summary_df, save_dir, metric="balanced_accuracy",para_type = pre_para.para_type)
+    plot_self_eval_mean_std(self_summary_df, save_dir, metric="accuracy",para_type = pre_para.para_type)
     plot_self_eval_mean_std(self_summary_df, save_dir, metric="mcc",para_type = pre_para.para_type)
+    # plot_self_eval_three_metrics(self_summary_df, save_dir, para_type=pre_para.para_type,)
 
     plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs,para_type = pre_para.para_type)
     plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs,para_type = pre_para.para_type)
+    plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="accuracy", total_runs=total_runs,para_type = pre_para.para_type)
+    # plot_cross_train_three_metrics(cross_train_batch_summary_df,save_dir,total_runs=total_runs,para_type=pre_para.para_type,)
+
     plot_cross_eval_batch_summary(cross_eval_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs,para_type = pre_para.para_type)
     plot_cross_eval_batch_summary(cross_eval_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs,para_type = pre_para.para_type)
+    plot_cross_eval_batch_summary(cross_eval_batch_summary_df, save_dir, metric="accuracy", total_runs=total_runs,para_type = pre_para.para_type)
+    # plot_cross_eval_three_metrics(cross_eval_batch_summary_df, save_dir, total_runs=total_runs, para_type=pre_para.para_type,)
+
     plot_train_vs_eval_summary(cross_train_batch_summary_df, cross_eval_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs,para_type = pre_para.para_type)
     plot_train_vs_eval_summary(cross_train_batch_summary_df, cross_eval_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs,para_type = pre_para.para_type)
+    plot_train_vs_eval_summary(cross_train_batch_summary_df, cross_eval_batch_summary_df, save_dir, metric="accuracy", total_runs=total_runs,para_type = pre_para.para_type)
     plot_cross_eval_heatmap(cross_matrix_summary_df, save_dir, metric="macro_f1",annotate_std=True,para_type = pre_para.para_type)
     plot_cross_eval_heatmap(cross_matrix_summary_df, save_dir, metric="mcc",annotate_std=True,para_type = pre_para.para_type)
+    plot_cross_eval_heatmap(cross_matrix_summary_df, save_dir, metric="accuracy",annotate_std=True,para_type = pre_para.para_type)
 
-    plot_financial_return_mean_std(
-        financial_summary_df,
-        save_dir,
-        metric="strategy_total_return",
-        para_type = pre_para.para_type,
-    )
-
-    plot_financial_return_mean_std(
-        financial_summary_df,
-        save_dir,
-        metric="signal_avg_return",
-        para_type = pre_para.para_type,
-    )
+    plot_financial_return_mean_std(financial_summary_df, save_dir, metric="strategy_total_return", para_type = pre_para.para_type, )
+    plot_financial_return_mean_std(financial_summary_df, save_dir, metric="signal_avg_return", para_type = pre_para.para_type,)
+    # plot_financial_three_means(financial_summary_df, save_dir, para_type=pre_para.para_type, random_metric="strategy_total_return_mean",)
 # -----------------------------
 # Entrypoint
 # -----------------------------

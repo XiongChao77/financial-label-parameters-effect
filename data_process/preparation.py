@@ -16,9 +16,9 @@ def plot_label_distribution(df, interval_ms, para, label_function):
     stop_range = [np.inf]
 
     if para.para_type == 'volatility':
-        parameter_range = np.arange(0.1, 5, 0.1).round(2)
+        parameter_range = np.arange(0.1, 10, 0.1).round(2)
     elif para.para_type == 'horizon':
-        parameter_range = np.arange(2, 80, 2).astype(int)
+        parameter_range = np.arange(1, 80, 1).astype(int)
     else:
         raise ValueError(f"Unsupported para_type: {para.para_type}")
 
@@ -104,8 +104,13 @@ def summary_statistics(para,prep_output_dir,df, logger):
         # 此时剩下的全部是真正的标签列（如 label_3.5_3.5），再从中安全地寻找 0 最少的列
         label_col = min(label_cols, key=lambda c: int((df[c] == 0).sum()))
         logger.info(f"strictest label column is {label_col}")
+    else:
+        label_col = 'label'
 
     # ---------------- Summary statistics ----------------
+    if 'open_time_date_utc' not in df.columns:
+        df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
+
     start_time = df['open_time_date_utc'].iloc[0]
     end_time = df['open_time_date_utc'].iloc[-1]
     duration = pd.to_datetime(end_time) - pd.to_datetime(start_time)
@@ -241,10 +246,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger, _ = common.setup_session_logger(sub_folder='dissertation/data_process')
     
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.5, 10, 0.1).round(1),predict_num=16) 
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier = 4)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.5, 8, 0.1).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(2, 80, 2), vol_multiplier = 4)
+    main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.1, 10, 0.1).round(1),predict_num=16) 
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier = 10)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.1, 10, 0.1).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(16, 80, 1), vol_multiplier = 10)
+
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_volatility, volatility_range= np.arange(0.1, 10, 0.1).round(1), predict_num = 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=10)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_volatility, volatility_range= np.arange(0.1,10, 0.1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_volatility, volatility_range= np.arange(0.1, 4, 0.1).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier=2)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_tbm_volatility, volatility_range= np.arange(0.5, 3, 0.1).round(1), predict_num= 16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_tbm_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier= 2)
+
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_volatility, volatility_range= np.arange(0.1, 6, 0.1).round(1), predict_num = 16)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_horizon, horizon_range= np.arange(2, 24, 2), vol_multiplier=3)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_tbm_volatility, volatility_range= np.arange(0.1, 6, 0.1), predict_num= 16)
@@ -252,4 +267,4 @@ if __name__ == "__main__":
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_volatility, volatility_range= np.arange(0.1, 4, 0.1).round(1), predict_num= 16)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_fthl_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier=2)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_volatility, volatility_range= np.arange(0.5, 3, 0.1).round(1), predict_num= 16)
-    main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_horizon, horizon_range= np.arange(2, 16, 2), vol_multiplier= 2)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_1d_tbm_horizon, horizon_range= np.arange(2, 16, 2), vol_multiplier= 2)

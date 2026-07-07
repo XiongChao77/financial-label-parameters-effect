@@ -30,8 +30,8 @@ os.makedirs(DATA_OUT_DIR, exist_ok=True)
 @dataclass
 class BaseDefine:
     #data source
-    market_category: str = "Cryptocurrency"   # cryptocurrency / stock / forex
-    data_source: str = "binance_public_data"                   # binance / yahoo / local_csv
+    market_category: str = "Cryptocurrency"   # cryptocurrency / Stock / Forex
+    data_source: str = "binance_public_data"                   # binance / yahoo / dukascopy
     # model
     vol_ewma_span: int  = 80
     predict_num: int = 16
@@ -41,7 +41,7 @@ class BaseDefine:
     vol_multiplier_short: float = 4
     stop_multiplier_rate_short: Optional[float] = None
     # market
-    symbol: str = "BTCUSDT"    #BTCUSDT ETHUSDT DOGEUSDT
+    symbol: str = "BTCUSDT"    #BTCUSDT ETHUSDT DOGEUSDT XAUUSD
     trading_type:str ='spot'             #spot  / um(USDT-M Futures) / cm    (Coin-M Futures)
     interval: str = "15m"
     para_type:str =  'horizon'  # volatility / horizon
@@ -62,6 +62,17 @@ QQQ_1d_fthl_volatility = BaseDefine(market_category="Stock", data_source="massiv
 QQQ_1d_fthl_horizon = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'FTHL')
 QQQ_1d_tbm_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'TBM')
 QQQ_1d_tbm_horizon = BaseDefine(market_category="Stock", data_source="massive", symbol="QQQ", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'TBM')
+
+XAUUSD_15m_fthl_volatility = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="15m", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'FTHL')
+XAUUSD_15m_fthl_horizon = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="15m", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'FTHL')
+XAUUSD_15m_tbm_volatility = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="15m", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'TBM')
+XAUUSD_15m_tbm_horizon = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="15m", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'TBM')
+
+XAUUSD_1d_fthl_volatility = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="1d", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'FTHL')
+XAUUSD_1d_fthl_horizon = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'FTHL')
+XAUUSD_1d_tbm_volatility = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="1d", trading_type='spot', version=0.1, para_type = 'volatility', label_type = 'TBM')
+XAUUSD_1d_tbm_horizon = BaseDefine(market_category="Forex", data_source="dukascopy", symbol="XAUUSD", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon', label_type = 'TBM')
+
 
 # SPY_1d_fthl_volatility = BaseDefine(market_category="Stock", data_source="massive", symbol="SPY", interval="1d", trading_type='spot', version=0.1, para_type = 'horizon')
 
@@ -148,7 +159,7 @@ def load_test_df_from_dir(base_dir):
 def get_data_config_path_in_dir(base_dir):
     return _data_path_in_dir(base_dir, "data_config_meta.json")
 
-def load_interval_ms_from_dir(base_dir) -> BaseDefine:
+def load_pre_params_from_dir(base_dir) -> BaseDefine:
     """Load interval settings from data_config_meta.json under base_dir (no global paths; multiprocessing-friendly)."""
     config_path = get_data_config_path_in_dir(base_dir)
     if not os.path.exists(config_path):
@@ -343,22 +354,28 @@ def attach_label(df, para = BaseDefine(), label_col = 'label'):
 
 # fixed-time horizon labeling
 def attach_fthl_label(df, para = BaseDefine(), label_col = 'label'):
+    time_col = 'open_time_ms_utc'
+    interval_ms = get_interval_ms(para.interval)
     if para.market_category == "Stock":
         if 'd' in para.interval:
             return attach_fthl_stock_daily(df, para, label_col)
         elif 'm' in para.interval:
             return attach_fthl_stock_minutely(df, para, label_col)
+        df['open_time_sn'] = df[time_col]// interval_ms
+    elif para.symbol == "XAUUSD":
+        #Weekend gaps were not separately removed, since they account for a very small proportion of the observations. However, this may introduce a small amount of calendar-time inconsistency for prediction windows crossing weekends.
+        df['open_time_sn'] = np.arange(len(df), dtype=np.int64)
+    else:
+        df['open_time_sn'] = df[time_col]// interval_ms
     """
     Path-dependent asymmetric labeling logic.
     """
-    time_col = 'open_time_ms_utc'
     time_values = df[time_col].values
     
     # 1. Compute asymmetric dynamic thresholds
     df = calculate_thresholds(df, para)
 
     # 2. Physical time anchoring (unchanged)
-    interval_ms = get_interval_ms(para.interval)
     df['open_time_sn'] = df[time_col]// interval_ms
     target_times = time_values + (para.predict_num * interval_ms)
     target_indices = np.searchsorted(time_values, target_times, side='left')
@@ -594,7 +611,9 @@ def attach_tbm_label(df, para=BaseDefine(), label_col = 'label'):
     elif para.market_category == "Cryptocurrency":
         df['open_time_sn'] = df['open_time_ms_utc']// interval_ms
         df = calculate_thresholds(df, para)
-
+    elif para.symbol == "XAUUSD":
+        df['open_time_sn'] = np.arange(len(df), dtype=np.int64)
+        df = calculate_thresholds(df, para)
     # 2. 准备底层数据
     close = df['close'].values.astype(np.float64)
     high = df['high'].values.astype(np.float64)

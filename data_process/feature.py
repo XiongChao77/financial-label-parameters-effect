@@ -1763,10 +1763,10 @@ class FeatureOrigin(FeatureBase):   # add taker_buy_base_volume/volume and taker
         #     df[f'base_{f}'] = df[f]
         pass
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        self._normalize_z_score_rel(X, feature_cols , self.price_base_features , feature_base = self.price_base_features[-1], factory= factory, method= 'log')
+        # self._normalize_z_score_rel(X, feature_cols , self.price_base_features , feature_base = self.price_base_features[-1], factory= factory, method= 'log')
         self._normalize_z_score_rel(X, feature_cols , self.volume_base_features , feature_base = self.volume_base_features[-1], factory= factory, method= 'log')
+        self._normalize_z_score_group(X, feature_cols , self.price_base_features , factory= factory, method= 'log')
         self._normalize_z_score_rel(X, feature_cols , self.quote_base_features , feature_base = self.quote_base_features[-1], factory= factory, method= 'log')
-        # self._normalize_z_score_group(X, feature_cols , self.price_base_features , factory= factory, method= 'log')
         # self._normalize_z_score_group(X, feature_cols , self.volume_base_features , factory= factory, method= 'log')
         # self._normalize_z_score_group(X, feature_cols , self.quote_base_features , factory= factory, method= 'log')#_normalize_z_score_group
         for f in self.self_based_features:
