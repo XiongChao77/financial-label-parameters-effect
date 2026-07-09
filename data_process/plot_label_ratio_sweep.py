@@ -239,6 +239,33 @@ class LabelRatioCurveAnalyzer:
             )
         return y.to_numpy(dtype=float)
 
+    @staticmethod
+    def _auto_ylim(*ys, lower=0.0, padding_ratio=0.10, min_upper=0.02, max_upper=None):
+        valid_values = []
+
+        for y in ys:
+            if y is None:
+                continue
+
+            arr = np.asarray(y, dtype=float)
+            arr = arr[np.isfinite(arr)]
+
+            if arr.size > 0:
+                valid_values.append(arr)
+
+        if not valid_values:
+            return None
+
+        values = np.concatenate(valid_values)
+        y_max = np.max(values)
+
+        upper = max(y_max * (1.0 + padding_ratio), min_upper)
+
+        if max_upper is not None:
+            upper = min(upper, max_upper)
+
+        return lower, upper
+        
     def _curve_data(self, df_plot, empirical_col, gaussian_col, smooth_window):
         x = df_plot["x"].to_numpy(dtype=float)
         empirical = self._smooth(df_plot[empirical_col].to_numpy(dtype=float), smooth_window)
@@ -296,14 +323,29 @@ class LabelRatioCurveAnalyzer:
         df_plot = self._single_stop_subset(stop_rate)
         saved_paths = {}
 
-        for class_name in ["positive", "negative", "neutral"]:
-            saved_paths[class_name] = self.plot_single_label_ratio_curve(
-                class_name=class_name,
-                stop_rate=stop_rate,
-                output_dir=output_dir,
-                smooth_window=smooth_window,
-                include_gaussian=include_gaussian,
-            )
+        # for class_name in ["positive", "negative", "neutral"]:
+        #     saved_paths[class_name] = self.plot_single_label_ratio_curve(
+        #         class_name=class_name,
+        #         stop_rate=stop_rate,
+        #         output_dir=output_dir,
+        #         smooth_window=smooth_window,
+        #         include_gaussian=include_gaussian,
+        #     )
+
+        saved_paths["positive_negative"] = self.plot_positive_negative_ratio_curves(
+            stop_rate=stop_rate,
+            output_dir=output_dir,
+            smooth_window=smooth_window,
+            include_gaussian=include_gaussian,
+        )
+
+        saved_paths["neutral"] = self.plot_single_label_ratio_curve(
+            class_name="neutral",
+            stop_rate=stop_rate,
+            output_dir=output_dir,
+            smooth_window=smooth_window,
+            include_gaussian=include_gaussian,
+        )
 
         overview_path = self.plot_distribution_overview(
             stop_rate=stop_rate,
@@ -345,6 +387,15 @@ class LabelRatioCurveAnalyzer:
         prefix = f"{self.label_type}_{self.para_type}_{class_name}"
         saved = {}
 
+        ratio_y_lim = self._auto_ylim(
+            empirical,
+            gaussian if include_gaussian else None,
+            lower=0.0,
+            padding_ratio=0.10,
+            min_upper=0.02,
+            max_upper=1.05,
+        )
+
         saved["ratio"] = self._plot_two_curves(
             x=x,
             y_emp=empirical,
@@ -356,7 +407,7 @@ class LabelRatioCurveAnalyzer:
             output_path=os.path.join(output_dir, f"{prefix}_ratio.png"),
             color=cfg["color"],
             include_gaussian=include_gaussian,
-            y_lim=(-0.05, 1.05),
+            y_lim=ratio_y_lim,
         )
 
         saved["first_derivative"] = self._plot_two_curves(
@@ -389,6 +440,119 @@ class LabelRatioCurveAnalyzer:
 
         return saved
 
+
+    def plot_positive_negative_ratio_curves(
+        self,
+        stop_rate=np.inf,
+        output_dir=None,
+        smooth_window=3,
+        include_gaussian=True,
+    ):
+        """
+        Plot positive and negative label-ratio curves together.
+
+        Generates three plots:
+            1) positive/negative ratio curve
+            2) first derivative curve
+            3) second derivative curve
+
+        The Gaussian reference curve is shared by positive and negative labels
+        under the zero-mean Gaussian assumption.
+        """
+        if output_dir is None:
+            output_dir = self.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        df_plot = self._single_stop_subset(stop_rate)
+
+        pos_cfg = self.CLASS_CONFIG["positive"]
+        neg_cfg = self.CLASS_CONFIG["negative"]
+
+        (
+            x,
+            pos_emp,
+            pos_gau,
+            pos_d1_emp,
+            pos_d1_gau,
+            pos_d2_emp,
+            pos_d2_gau,
+        ) = self._curve_data(
+            df_plot=df_plot,
+            empirical_col=pos_cfg["col"],
+            gaussian_col=pos_cfg["gaussian_col"],
+            smooth_window=smooth_window,
+        )
+
+        (
+            _,
+            neg_emp,
+            neg_gau,
+            neg_d1_emp,
+            neg_d1_gau,
+            neg_d2_emp,
+            neg_d2_gau,
+        ) = self._curve_data(
+            df_plot=df_plot,
+            empirical_col=neg_cfg["col"],
+            gaussian_col=neg_cfg["gaussian_col"],
+            smooth_window=smooth_window,
+        )
+
+        # Under the zero-mean Gaussian reference:
+        # g_positive == g_negative.
+        # Use one shared Gaussian curve.
+        gaussian = pos_gau
+        d1_gaussian = pos_d1_gau
+        d2_gaussian = pos_d2_gau
+
+        prefix = f"{self.label_type}_{self.para_type}_positive_negative"
+        saved = {}
+
+        ratio_y_lim = self._auto_ylim(
+            pos_emp,
+            neg_emp,
+            gaussian if include_gaussian else None,
+            lower=0.0,
+            padding_ratio=0.10,
+            min_upper=0.02,
+            max_upper=1.05,
+        )
+
+        saved["ratio"] = self._plot_positive_negative_with_gaussian(
+            x=x,
+            y_pos=pos_emp,
+            y_neg=neg_emp,
+            y_gau=gaussian if include_gaussian else None,
+            title=f"Positive and Negative Label Ratios vs {self._x_label()}",
+            ylabel="Label ratio",
+            output_path=os.path.join(output_dir, f"{prefix}_ratio.png"),
+            y_lim=ratio_y_lim,
+        )
+
+        saved["first_derivative"] = self._plot_positive_negative_with_gaussian(
+            x=x,
+            y_pos=pos_d1_emp,
+            y_neg=neg_d1_emp,
+            y_gau=d1_gaussian if include_gaussian else None,
+            title="First Derivative of Positive and Negative Label Ratios",
+            ylabel="First derivative",
+            output_path=os.path.join(output_dir, f"{prefix}_d1.png"),
+            add_zero_line=True,
+        )
+
+        saved["second_derivative"] = self._plot_positive_negative_with_gaussian(
+            x=x,
+            y_pos=pos_d2_emp,
+            y_neg=neg_d2_emp,
+            y_gau=d2_gaussian if include_gaussian else None,
+            title="Second Derivative of Positive and Negative Label Ratios",
+            ylabel="Second derivative",
+            output_path=os.path.join(output_dir, f"{prefix}_d2.png"),
+            add_zero_line=True,
+        )
+
+        return saved
+
     def plot_distribution_overview(
         self,
         stop_rate=np.inf,
@@ -413,6 +577,7 @@ class LabelRatioCurveAnalyzer:
                 x,
                 y_emp,
                 marker="o",
+                markersize=4,
                 linewidth=2.2,
                 color=cfg["color"],
                 label=f"{class_name.capitalize()} empirical",
@@ -470,7 +635,8 @@ class LabelRatioCurveAnalyzer:
             x,
             y_emp,
             marker="o",
-            linewidth=2.5,
+            markersize=4,
+            linewidth=1.5,
             color=color,
             label=empirical_label,
         )
@@ -503,5 +669,72 @@ class LabelRatioCurveAnalyzer:
         plt.tight_layout()
         plt.savefig(output_path, dpi=250, bbox_inches="tight")
         plt.close()
+        print(f"✅ Plot saved: {output_path}")
+        return output_path
+
+    def _plot_positive_negative_with_gaussian(
+        self,
+        x,
+        y_pos,
+        y_neg,
+        y_gau,
+        title,
+        ylabel,
+        output_path,
+        y_lim=None,
+        add_zero_line=False,
+    ):
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        ax.plot(
+            x,
+            y_pos,
+            marker="o",
+            markersize=4,
+            linewidth=1.5,
+            color="green",
+            label="Positive empirical",
+        )
+
+        ax.plot(
+            x,
+            y_neg,
+            marker="o",
+            markersize=4,
+            linewidth=1.5,
+            color="red",
+            label="Negative empirical",
+        )
+
+        ax.plot(
+            x,
+            y_gau,
+            linestyle="--",
+            linewidth=2.0,
+            color="black",
+            alpha=0.8,
+            label="Gaussian reference",
+        )
+
+        if add_zero_line:
+            ax.axhline(0.0, color="black", linestyle=":", alpha=0.5)
+
+        ax.set_xlabel(self._x_label(), fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(
+            f"{title}\n{self.label_type.upper()} / {self.para_type}",
+            fontsize=14,
+            fontweight="bold",
+        )
+
+        if y_lim is not None:
+            ax.set_ylim(*y_lim)
+
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(loc="best", frameon=True, shadow=True)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=250, bbox_inches="tight")
+        plt.close()
+
         print(f"✅ Plot saved: {output_path}")
         return output_path

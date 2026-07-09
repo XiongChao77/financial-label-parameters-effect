@@ -175,6 +175,14 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
     # Feature engineering must explicitly handle volume==0 cases.
     df = common.clean_data_quality_auto(df,logger)
     # 3. Pass interval_ms to label logic so it can adapt its volatility window to the real time span.
+    if para.para_type == 'volatility':
+        para.predict_num = kwargs['predict_num']
+    elif para.para_type == 'horizon':
+        vol_multiplier = kwargs['vol_multiplier']
+        para.vol_multiplier_long = vol_multiplier
+        para.stop_multiplier_rate_long = None
+        para.vol_multiplier_short = vol_multiplier
+        para.stop_multiplier_rate_short = None
     if args.mode == 'plot':
         plot_label_distribution(df, interval_ms, para, common.attach_label)        # 4. Run analysis
 
@@ -203,7 +211,6 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
             return df
 
         if para.para_type == 'volatility':
-            para.predict_num = kwargs['predict_num']
             volatility_range = kwargs['volatility_range']
             for t_range in volatility_range:
                 para.vol_multiplier_long = t_range
@@ -214,11 +221,6 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
                 para_label = f'label_{label_suffix}'
                 df = common.attach_label(df, para=para, label_col=para_label)
         elif para.para_type == 'horizon':
-            vol_multiplier = kwargs['vol_multiplier']
-            para.vol_multiplier_long = vol_multiplier
-            para.stop_multiplier_rate_long = None
-            para.vol_multiplier_short = vol_multiplier
-            para.stop_multiplier_rate_short = None
             horizon_range = kwargs['horizon_range']
             for t_range in horizon_range:
                 para.predict_num = t_range
@@ -246,13 +248,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger, _ = common.setup_session_logger(sub_folder='dissertation/data_process')
     
-    main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.1, 10, 0.1).round(1),predict_num=16) 
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.1, 10, 0.1).round(1),predict_num=16) 
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier = 10)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.1, 10, 0.1).round(1), predict_num= 16)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(16, 80, 1), vol_multiplier = 10)
 
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_volatility, volatility_range= np.arange(0.1, 10, 0.1).round(1), predict_num = 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=10)
+    main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=10)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_volatility, volatility_range= np.arange(0.1,10, 0.1), predict_num= 16)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=4)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_volatility, volatility_range= np.arange(0.1, 4, 0.1).round(1), predict_num= 16)

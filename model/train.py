@@ -13,6 +13,10 @@ Fixed Neutral Subsampling Experiment (Probe)
 """
 
 import os,sys,re
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import time
 import logging
 import warnings
@@ -31,6 +35,10 @@ from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score, balance
 from sklearn.exceptions import ConvergenceWarning
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import copy
+
 current_work_dir = os.path.dirname(__file__)
 sys.path.append(os.path.join(current_work_dir, ".."))
 from data_process import common
@@ -2111,6 +2119,280 @@ def predict_lstm_model(
 # -----------------------------
 # Core experiment
 # -----------------------------
+
+def _get_worker_logger(run_id: int, log_dir: str) -> logging.Logger:
+    logger = logging.getLogger(f"run_worker_{run_id}")
+    if not logger.handlers:
+        os.makedirs(log_dir, exist_ok=True)
+        handler = logging.FileHandler(os.path.join(log_dir, f"run_{run_id}.log"))
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger
+
+
+def run_single_iteration(
+    run_id: int,
+    total_runs: int,
+    train_cfg_seed: int,
+    labels_matrix: np.ndarray,
+    label_cols: list,
+    label_suffix: str,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    window_indices: np.ndarray,
+    X_full: np.ndarray,
+    X_full_flat: np.ndarray,
+    df: pd.DataFrame,
+    pre_para: common.BaseDefine,
+    train_cfg: TrainConfig,
+    strictest_train_target_n: int,
+    strictest_val_target_n: int,
+    strictest_test_target_n: int,
+    log_dir: str,
+) -> Tuple[list, list, list]:
+    """
+    单个 run_id 的完整训练+评估逻辑，在独立进程中执行。
+    返回该 run 产生的三份行数据，供主进程汇总。
+    """
+    # 避免 20 个进程同时抢占 CPU 线程（sklearn / numpy BLAS）
+    torch.set_num_threads(1)
+
+    logger = _get_worker_logger(run_id, log_dir)
+    logger.info(f"Starting run {run_id+1}/{total_runs}")
+
+    self_eval_rows_local = []
+    cross_eval_rows_local = []
+    financial_metrics_local = []
+
+    t_seed = train_cfg_seed + run_id * 10000
+
+    experiment_datsets = prepare_parameter_regime_datasets(
+        logger, t_seed, labels_matrix,
+        train_idx, val_idx, test_idx, label_cols,
+        strictest_train_target_n, strictest_val_target_n, strictest_test_target_n,
+    )
+    random_baseline_done = set()
+
+    for experiment_model in ['DecisionTree', 'LogisticRegression', 'LSTM']:
+        if 'd' in pre_para.interval and experiment_model == 'LSTM':
+            logger.info(
+                f"skip LSTM on {pre_para.symbol}_{pre_para.interval}, "
+                f"since the dataset is insufficient to complete the training."
+            )
+            continue
+
+        for col_idx, col_name in enumerate(label_cols):
+            logger.info(f"{experiment_model} train {col_name}")
+            y_all = labels_matrix[:, col_idx].astype(np.int64)
+
+            if pre_para.para_type == 'volatility':
+                threshold = int(col_name.replace(label_suffix, "")) / 10.0
+                para_horizon = pre_para.predict_num
+            elif pre_para.para_type == 'horizon':
+                threshold = int(col_name.replace(label_suffix, ""))
+                para_horizon = threshold
+
+            train_index = experiment_datsets[col_name]["balanced_train_idx"]
+            n_eff = len(train_index) // 3
+            test_index = experiment_datsets[col_name]["balanced_test_idx"]
+
+            X_tr_flat = X_full_flat[train_index]
+            X_tr_seq = X_full[train_index]
+            y_tr = y_all[train_index]
+
+            logger.info(
+                f"Starting experiment: Model={experiment_model} | "
+                f"train_size={len(train_index)} (effective balanced size per class={n_eff}) | "
+                f"test_size={len(test_index)}"
+            )
+
+            if experiment_model == 'LogisticRegression':
+                model = LogisticRegression(
+                    solver=train_cfg.lr_solver,
+                    max_iter=train_cfg.lr_max_iter,
+                    C=train_cfg.lr_C,
+                )
+                model.fit(X_tr_flat, y_tr)
+            elif experiment_model == 'DecisionTree':
+                model = DecisionTreeClassifier(
+                    min_samples_leaf=max(20, int(0.01 * len(y_tr))),
+                    max_depth=5,
+                    random_state=t_seed,
+                )
+                model.fit(X_tr_flat, y_tr)
+            elif experiment_model == 'LSTM':
+                val_index = experiment_datsets[col_name]["balanced_val_idx"]
+                X_val_seq = X_full[val_index]
+                y_val = y_all[val_index]
+                model = train_lstm_model(
+                    X_train=X_tr_seq,
+                    y_train=y_tr,
+                    X_val=X_val_seq,
+                    y_val=y_val,
+                    seed=t_seed,
+                    num_classes=3,
+                    epochs=20,
+                    batch_size=128,
+                    lr=1e-3,
+                    hidden_size=64,
+                    num_layers=2,
+                    dropout=0.2,
+                    patience=5,
+                    logger=logger,
+                )
+
+            # Within-Regime Evaluation
+            y_te_bal = y_all[test_index]
+            if experiment_model == 'LSTM':
+                X_te_bal = X_full[test_index]
+                y_pred_bal = predict_lstm_model(model, X_te_bal)
+            else:
+                X_te_bal = X_full_flat[test_index]
+                y_pred_bal = model.predict(X_te_bal)
+
+            f1_bal = float(f1_score(y_te_bal, y_pred_bal, average="macro"))
+            mcc_bal = float(matthews_corrcoef(y_te_bal, y_pred_bal))
+            acc = float(accuracy_score(y_te_bal, y_pred_bal))
+            class_labels = [common.Signal.POSITIVE, common.Signal.NEGATIVE, common.Signal.NEUTRAL]
+            p_class, r_class, f_class, _ = precision_recall_fscore_support(
+                y_te_bal, y_pred_bal, labels=class_labels, zero_division=0
+            )
+
+            n_pos = int(np.sum(y_all[test_idx] == common.Signal.POSITIVE))
+            n_neg = int(np.sum(y_all[test_idx] == common.Signal.NEGATIVE))
+            n_neu = int(np.sum(y_all[test_idx] == common.Signal.NEUTRAL))
+            balanced_class_size = min(n_pos, n_neg, n_neu)
+
+            logger.info(
+                f"{col_name} | raw test counts: pos={n_pos}, neg={n_neg}, neu={n_neu}, "
+                f"balanced_class_size={balanced_class_size}"
+            )
+
+            self_eval_rows_local.append(
+                {
+                    "run_id": run_id,
+                    "model": experiment_model,
+                    "eval_mode": 'balanced',
+                    "label_name": col_name,
+                    "threshold": threshold,
+                    "macro_f1": f1_bal,
+                    "mcc": mcc_bal,
+                    "accuracy": acc,
+                    "p_pos": p_class[0], "r_pos": r_class[0], "f_pos": f_class[0],
+                    "p_neg": p_class[1], "r_neg": r_class[1], "f_neg": f_class[1],
+                    "p_neu": p_class[2], "r_neu": r_class[2], "f_neu": f_class[2],
+                    "n_eff": n_eff,
+                    "train_size": int(3 * n_eff),
+                    "test_size": int(len(y_te_bal)),
+                    "test_pos_raw": n_pos,
+                    "test_neg_raw": n_neg,
+                    "test_neu_raw": n_neu,
+                    "balanced_class_size": balanced_class_size,
+                }
+            )
+
+            # Cross-Regime Evaluation
+            for eval_mode in ['balanced', 'raw']:
+                for eval_col_idx, eval_col_name in enumerate(label_cols):
+                    y_all_eval = labels_matrix[:, eval_col_idx].astype(np.int64)
+                    if pre_para.para_type == 'volatility':
+                        eval_threshold = int(eval_col_name.replace(label_suffix, "")) / 10.0
+                    elif pre_para.para_type == 'horizon':
+                        eval_threshold = int(eval_col_name.replace(label_suffix, ""))
+
+                    if eval_mode == 'balanced':
+                        eval_test_idx = experiment_datsets[eval_col_name]["balanced_test_idx"]
+                    elif eval_mode == 'raw':
+                        eval_test_idx = test_idx
+                    y_te_cross = y_all_eval[eval_test_idx]
+
+                    if experiment_model == 'LSTM':
+                        X_te_cross = X_full[eval_test_idx]
+                        y_pred_cross = predict_lstm_model(model, X_te_cross)
+                    else:
+                        X_te_cross = X_full_flat[eval_test_idx]
+                        y_pred_cross = model.predict(X_te_cross)
+
+                    f1_cross = float(f1_score(y_te_cross, y_pred_cross, average="macro"))
+                    mcc_cross = float(matthews_corrcoef(y_te_cross, y_pred_cross))
+                    acc_cross = float(accuracy_score(y_te_cross, y_pred_cross))
+
+                    cross_eval_rows_local.append(
+                        {
+                            "run_id": run_id,
+                            "model": experiment_model,
+                            "train_size": int(3 * n_eff),
+                            "eval_mode": eval_mode,
+                            "train_label_name": col_name,
+                            "train_threshold": threshold,
+                            "eval_label_name": eval_col_name,
+                            "eval_threshold": eval_threshold,
+                            "macro_f1": f1_cross,
+                            "mcc": mcc_cross,
+                            "accuracy": acc_cross,
+                            "test_size": int(len(y_te_cross)),
+                        }
+                    )
+
+            # Financial return backtest
+            if col_name not in random_baseline_done:
+                y_random_pred = generate_random_predictions(
+                    n=len(test_idx),
+                    seed=t_seed + 900000 + col_idx,
+                )
+                begin_time = time.time()
+                random_financial_metrics = compute_financial_returns(
+                    df=df, pre_para=pre_para, para_horizon=para_horizon,
+                    window_indices=window_indices, sample_idx=test_idx,
+                    y_pred=y_random_pred, label_col=col_name,
+                    initial_cash=10000.0, fee_rates=[0.0, 0.0005], price_col="close",
+                )
+                end_time = time.time()
+                logger.info(
+                    f"compute RandomPredict financial_returns for {col_name} "
+                    f"takes time: {(end_time - begin_time):.2f} seconds"
+                )
+                for fm in random_financial_metrics:
+                    financial_metrics_local.append(
+                        {
+                            "run_id": run_id, "model": "RandomPredict", "eval_mode": "raw_test",
+                            "label_name": col_name, "threshold": threshold,
+                            "test_size": int(len(test_idx)), **fm,
+                        }
+                    )
+                random_baseline_done.add(col_name)
+
+            if experiment_model == 'LSTM':
+                X_test = X_full[test_idx]
+                y_test_pred = predict_lstm_model(model, X_test)
+            else:
+                X_test = X_full_flat[test_idx]
+                y_test_pred = model.predict(X_test)
+
+            begin_time = time.time()
+            financial_metrics = compute_financial_returns(
+                df=df, pre_para=pre_para, para_horizon=para_horizon,
+                window_indices=window_indices, sample_idx=test_idx,
+                y_pred=y_test_pred, label_col=col_name,
+                initial_cash=10000.0, fee_rates=[0.0, 0.0005], price_col="close",
+            )
+            end_time = time.time()
+            logger.info(f"compute_financial_returns takes time: {(end_time - begin_time):.2f} seconds")
+            for fm in financial_metrics:
+                financial_metrics_local.append(
+                    {
+                        "run_id": run_id, "model": experiment_model, "eval_mode": "raw_test",
+                        "label_name": col_name, "threshold": threshold,
+                        "test_size": int(len(test_idx)), **fm,
+                    }
+                )
+
+    logger.info(f"Finished run {run_id+1}/{total_runs}")
+    return self_eval_rows_local, cross_eval_rows_local, financial_metrics_local
+
 def run_fixed_neutral_subsampling_experiment(
     logger: logging.Logger,
     data_cfg: DataConfig,
@@ -2118,15 +2400,15 @@ def run_fixed_neutral_subsampling_experiment(
     pre_para: common.BaseDefine,
     prep_output_dir: str,
     save_dir: str,
+    max_workers: int ,   # None -> 默认用 total_runs（你说显存够20个并发）
 ):
     set_seed(train_cfg.seed)
-    # warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
     df = common.load_train_df_from_dir(prep_output_dir)
     if pre_para is None:
         pre_para = common.load_pre_params_from_dir(prep_output_dir)
         logger.info(f"load pre_para from {prep_output_dir}")
-    save_dir = os.path.join(save_dir, f"{pre_para.symbol}_{pre_para.interval}",pre_para.label_type,pre_para.para_type)
+    save_dir = os.path.join(save_dir, f"{pre_para.symbol}_{pre_para.interval}", pre_para.label_type, pre_para.para_type)
     os.makedirs(save_dir, exist_ok=True)
     kline_interval_ms = common.get_interval_ms(pre_para.interval)
 
@@ -2144,14 +2426,10 @@ def run_fixed_neutral_subsampling_experiment(
         raise RuntimeError(f"No {label_suffix}xx columns found in df.")
 
     master_ds = TimeSeriesWindowDataset(
-        df=df,
-        kline_interval_ms=kline_interval_ms,
-        feature_cols=train_cfg.feature_conf_list,
-        label_col=label_cols[0],
-        window=train_cfg.seq_len,
-        stride=train_cfg.stride,
-        use_cache=False,
-        show_feature_distribution=True,
+        df=df, kline_interval_ms=kline_interval_ms,
+        feature_cols=train_cfg.feature_conf_list, label_col=label_cols[0],
+        window=train_cfg.seq_len, stride=train_cfg.stride,
+        use_cache=False, show_feature_distribution=True,
     )
 
     window_indices = master_ds.indices
@@ -2164,14 +2442,11 @@ def run_fixed_neutral_subsampling_experiment(
 
     tr_rng, va_rng, te_rng = chrono_split_by_window_ends(M, data_cfg.train_ratio, data_cfg.val_ratio)
     train_idx = np.arange(tr_rng[0], tr_rng[1])
-    val_idx   = np.arange(va_rng[0], va_rng[1])
-    test_idx  = np.arange(te_rng[0], te_rng[1])
+    val_idx = np.arange(va_rng[0], va_rng[1])
+    test_idx = np.arange(te_rng[0], te_rng[1])
 
     logger.info(f"Master windows M={M} | train={len(train_idx)} | val={len(val_idx)} | test={len(test_idx)}")
 
-    self_eval_rows = []
-    cross_eval_rows = []
-    financial_metrics_list = []
     total_runs = 20
 
     strictest_train_target_n = np.inf
@@ -2180,8 +2455,8 @@ def run_fixed_neutral_subsampling_experiment(
     for col_idx, col_name in enumerate(label_cols):
         y_all = labels_matrix[:, col_idx].astype(np.int64)
         _, _, _, train_target_n = compute_minimum_size(y_all, train_idx)
-        _, _, _, val_target_n   = compute_minimum_size(y_all, val_idx)
-        _, _, _, test_target_n  = compute_minimum_size(y_all, test_idx)
+        _, _, _, val_target_n = compute_minimum_size(y_all, val_idx)
+        _, _, _, test_target_n = compute_minimum_size(y_all, test_idx)
         if train_target_n < strictest_train_target_n:
             strictest_train_target_n = train_target_n
             logger.info(f"New strictest train target n={strictest_train_target_n} found at column {col_name}")
@@ -2191,250 +2466,67 @@ def run_fixed_neutral_subsampling_experiment(
         if test_target_n < strictest_test_target_n:
             strictest_test_target_n = test_target_n
             logger.info(f"New strictest test target n={strictest_test_target_n} found at column {col_name}")
-    # exit()
-    for run_id in range(total_runs):
-        logger.info(f"Starting run {run_id+1}/{total_runs}")
-        t_seed = train_cfg.seed + run_id*10000
-        experiment_datsets = prepare_parameter_regime_datasets(
-            logger, t_seed, labels_matrix,
-            train_idx, val_idx, test_idx, label_cols,
-            strictest_train_target_n, strictest_val_target_n, strictest_test_target_n,
-        )
-        random_baseline_done = set()
-        
-        for experiment_model in ['DecisionTree', 'LogisticRegression', 'LSTM']:#['LSTM']: #
-            if 'd' in pre_para.interval and experiment_model == 'LSTM':
-                logger.info(f"skip LSTM on {pre_para.symbol}_{pre_para.interval}, since the dataset is insufficient to complete the training.")
-                continue
-            #train
-            for col_idx, col_name in enumerate(label_cols):
-                logger.info(f"{experiment_model} train {col_name}")
-                y_all = labels_matrix[:, col_idx].astype(np.int64)
-                if pre_para.para_type == 'volatility':
-                    threshold = int(col_name.replace(label_suffix, "")) / 10.0
-                    para_horizon = pre_para.predict_num
-                elif pre_para.para_type == 'horizon':
-                    threshold = int(col_name.replace(label_suffix, ""))
-                    para_horizon = threshold
 
-                # if eval_mode == 'balanced' or ['raw']:
-                train_index = experiment_datsets[col_name]["balanced_train_idx"]
-                n_eff = len(train_index) // 3
-                test_index = experiment_datsets[col_name]["balanced_test_idx"]
-                # elif eval_mode == 'raw':
-                #     train_index = train_idx
-                #     n_eff = len(train_index) // 3
-                #     test_index = test_idx
-                X_tr_flat = X_full_flat[train_index]
-                X_tr_seq = X_full[train_index]
-                y_tr = y_all[train_index]
-                logger.info(f"Starting experiment: Model={experiment_model} | train_size={len(train_index)} (effective balanced size per class={n_eff}) | test_size={len(test_index)}")
-                if experiment_model == 'LogisticRegression':
-                    model = LogisticRegression(
-                        solver=train_cfg.lr_solver,
-                        max_iter=train_cfg.lr_max_iter,
-                        C=train_cfg.lr_C,
-                    )
-                    model.fit(X_tr_flat, y_tr)
-                elif experiment_model == 'DecisionTree':
-                    model = DecisionTreeClassifier(
-                        min_samples_leaf=max(20, int(0.01 * len(y_tr))),
-                        max_depth=5,
-                        random_state=t_seed)
-                    model.fit(X_tr_flat, y_tr)
-                elif experiment_model == 'LSTM':
-                    val_index = experiment_datsets[col_name]["balanced_val_idx"]
-                    X_val_seq = X_full[val_index]
-                    y_val = y_all[val_index]
-                    model = train_lstm_model(
-                        X_train=X_tr_seq,
-                        y_train=y_tr,
-                        X_val=X_val_seq,
-                        y_val=y_val,
-                        seed=t_seed,
-                        num_classes=3,
-                        epochs=20,
-                        batch_size=128,
-                        lr=1e-3,
-                        hidden_size=64,
-                        num_layers=2,
-                        dropout=0.2,
-                        patience=5,
-                        logger=logger,
-                    )
-                
-                # Within-Regime Evaluation: balanced test set
-                y_te_bal = y_all[test_index]
+    # =====================================================
+    # 并发跑 total_runs 个 run_id
+    # =====================================================
+    log_dir = os.path.join(save_dir, "run_logs")
+    os.makedirs(log_dir, exist_ok=True)
 
-                if experiment_model == 'LSTM':
-                    X_te_bal = X_full[test_index]
-                    y_pred_bal = predict_lstm_model(model, X_te_bal)
-                else:
-                    X_te_bal = X_full_flat[test_index]
-                    y_pred_bal = model.predict(X_te_bal)
-                f1_bal = float(f1_score(y_te_bal, y_pred_bal, average="macro"))
-                mcc_bal = float(matthews_corrcoef(y_te_bal, y_pred_bal))
-                acc = float(accuracy_score(y_te_bal, y_pred_bal))
-                class_labels = [common.Signal.POSITIVE, common.Signal.NEGATIVE, common.Signal.NEUTRAL]
-                p_class, r_class, f_class, _ = precision_recall_fscore_support(
-                    y_te_bal, y_pred_bal, labels=class_labels, zero_division=0
-                )
+    self_eval_rows, cross_eval_rows, financial_metrics_list = [], [], []
 
-                n_pos = int(np.sum(y_all[test_idx] == common.Signal.POSITIVE))
-                n_neg = int(np.sum(y_all[test_idx] == common.Signal.NEGATIVE))
-                n_neu = int(np.sum(y_all[test_idx] == common.Signal.NEUTRAL))
-                balanced_class_size = min(n_pos, n_neg, n_neu)
+    ctx = mp.get_context("spawn")  # 必须用 spawn，避免 CUDA + fork 的问题
 
+    logger.info(f"Launching {total_runs} runs with max_workers={max_workers} (spawn context)")
+
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = {
+            executor.submit(
+                run_single_iteration,
+                run_id=run_id,
+                total_runs=total_runs,
+                train_cfg_seed=train_cfg.seed,
+                labels_matrix=labels_matrix,
+                label_cols=label_cols,
+                label_suffix=label_suffix,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                test_idx=test_idx,
+                window_indices=window_indices,
+                X_full=X_full,
+                X_full_flat=X_full_flat,
+                df=df,
+                pre_para=pre_para,
+                train_cfg=train_cfg,
+                strictest_train_target_n=strictest_train_target_n,
+                strictest_val_target_n=strictest_val_target_n,
+                strictest_test_target_n=strictest_test_target_n,
+                log_dir=log_dir,
+            ): run_id
+            for run_id in range(total_runs)
+        }
+
+        completed = 0
+        for future in as_completed(futures):
+            run_id = futures[future]
+            try:
+                se_rows, ce_rows, fm_rows = future.result()
+                self_eval_rows.extend(se_rows)
+                cross_eval_rows.extend(ce_rows)
+                financial_metrics_list.extend(fm_rows)
+                completed += 1
                 logger.info(
-                    f"{col_name} | raw test counts: pos={n_pos}, neg={n_neg}, neu={n_neu}, "
-                    f"balanced_class_size={balanced_class_size}"
+                    f"[{completed}/{total_runs}] run_id={run_id} finished, "
+                    f"{len(se_rows)} self-eval rows collected"
                 )
-                self_eval_rows.append(
-                    {
-                        "run_id": run_id,
-                        "model": experiment_model,
-                        "eval_mode": 'balanced',
-                        "label_name": col_name,
-                        "threshold": threshold,
-                        "macro_f1": f1_bal,
-                        "mcc": mcc_bal,
-                        "accuracy": acc,
-                        "p_pos": p_class[0], "r_pos": r_class[0], "f_pos": f_class[0],
-                        "p_neg": p_class[1], "r_neg": r_class[1], "f_neg": f_class[1],
-                        "p_neu": p_class[2], "r_neu": r_class[2], "f_neu": f_class[2],
-                        "n_eff": n_eff,
-                        "train_size": int(3 * n_eff),
-                        "test_size": int(len(y_te_bal)),
-                        "test_pos_raw": n_pos,
-                        "test_neg_raw": n_neg,
-                        "test_neu_raw": n_neu,
-                        "balanced_class_size": balanced_class_size,
-                    }
-                )
+            except Exception:
+                logger.exception(f"run_id={run_id} raised an exception")
+                raise  # 任何一个 run 出错都直接终止，避免拿到不完整/有偏的结果
 
-                # Cross-Regime Evaluation: evaluate on all test sets with different thresholds
-                for eval_mode in ['balanced','raw']:
-                    for eval_col_idx, eval_col_name in enumerate(label_cols):
-                        y_all = labels_matrix[:, eval_col_idx].astype(np.int64)
-                        if pre_para.para_type == 'volatility':
-                            eval_threshold = int(eval_col_name.replace(label_suffix, "")) / 10.0
-                        elif pre_para.para_type == 'horizon':
-                            eval_threshold = int(eval_col_name.replace(label_suffix, ""))
-
-                        if eval_mode == 'balanced':
-                            eval_test_idx  = experiment_datsets[eval_col_name]["balanced_test_idx"]
-                        elif eval_mode == 'raw':
-                            eval_test_idx = test_idx
-                        y_te_bal = y_all[eval_test_idx]
-
-                        if experiment_model == 'LSTM':
-                            X_te_bal = X_full[eval_test_idx]
-                            y_pred_cross = predict_lstm_model(model, X_te_bal)
-                        else:
-                            X_te_bal = X_full_flat[eval_test_idx]
-                            y_pred_cross = model.predict(X_te_bal)
-
-                        f1_cross = float(f1_score(y_te_bal, y_pred_cross , average="macro"))
-                        mcc_bal = float(matthews_corrcoef(y_te_bal, y_pred_cross))
-                        acc_cross = float(accuracy_score(y_te_bal, y_pred_cross))
-
-                        cross_eval_rows.append(
-                            {
-                                "run_id": run_id,
-                                "model": experiment_model,
-                                "train_size": int(3 * n_eff),
-                                "eval_mode": eval_mode,
-                                "train_label_name": col_name,
-                                "train_threshold": threshold,
-                                "eval_label_name": eval_col_name,
-                                "eval_threshold": eval_threshold,
-                                "macro_f1": f1_cross,
-                                "mcc": mcc_bal,
-                                "accuracy": acc_cross,
-                                "test_size": int(len(y_te_bal)),
-                            }
-                        )
-                #financial return backtest
-
-                # =====================================================
-                # RandomPredict financial baseline
-                # Compute only once for each run + label column.
-                # =====================================================
-                if col_name not in random_baseline_done:
-                    y_random_pred = generate_random_predictions(
-                        n=len(test_idx),
-                        seed=t_seed + 900000 + col_idx,
-                    )
-
-                    begin_time = time.time()
-
-                    random_financial_metrics = compute_financial_returns(
-                        df=df,
-                        pre_para=pre_para,
-                        para_horizon=para_horizon,
-                        window_indices=window_indices,
-                        sample_idx=test_idx,
-                        y_pred=y_random_pred,
-                        label_col=col_name,
-                        initial_cash=10000.0,
-                        fee_rates=[0.0, 0.0005],
-                        price_col="close",
-                    )
-
-                    end_time = time.time()
-                    logger.info(
-                        f"compute RandomPredict financial_returns for {col_name} "
-                        f"takes time: {(end_time - begin_time):.2f} seconds"
-                    )
-
-                    for fm in random_financial_metrics:
-                        financial_metrics_list.append(
-                            {
-                                "run_id": run_id,
-                                "model": "RandomPredict",
-                                "eval_mode": "raw_test",
-                                "label_name": col_name,
-                                "threshold": threshold,
-                                "test_size": int(len(test_idx)),
-                                **fm,
-                            }
-                        )
-
-                    random_baseline_done.add(col_name)
-                    
-                if experiment_model == 'LSTM':
-                    X_test = X_full[test_idx]
-                    y_test_pred = predict_lstm_model(model, X_test)
-                else:
-                    X_test = X_full_flat[test_idx]
-                    y_test_pred = model.predict(X_test)
-                begin_time = time.time()
-                financial_metrics = compute_financial_returns(
-                    df=df,
-                    pre_para = pre_para,
-                    para_horizon = para_horizon,
-                    window_indices=window_indices,
-                    sample_idx=test_idx,
-                    y_pred=y_test_pred,
-                    label_col=col_name,
-                    initial_cash=10000.0,
-                    fee_rates=[0.0, 0.0005],
-                    price_col="close",
-                )
-                end_time = time.time()
-                logger.info(f"compute_financial_returns takes time: {(end_time - begin_time):.2f} seconds")
-                for fm in financial_metrics:
-                    financial_metrics_list.append(
-                        {
-                            "run_id": run_id,
-                            "model": experiment_model,
-                            "eval_mode": "raw_test",
-                            "label_name": col_name,
-                            "threshold": threshold,
-                            "test_size": int(len(test_idx)),
-                            **fm,
-                        }
-                    )
+    # ---- 为了让保存的 CSV / 后续分析结果与运行顺序无关，按 run_id 排序 ----
+    self_eval_rows.sort(key=lambda r: (r["run_id"], r["model"], r["threshold"]))
+    cross_eval_rows.sort(key=lambda r: (r["run_id"], r["model"], r["train_threshold"], r["eval_threshold"]))
+    financial_metrics_list.sort(key=lambda r: (r["run_id"], r["model"], r["threshold"], r["fee_rate"]))
 
     self_eval_df = pd.DataFrame(self_eval_rows)
     cross_eval_df = pd.DataFrame(cross_eval_rows)
@@ -2626,6 +2718,7 @@ def main(
         pre_para=pre_para,
         prep_output_dir=prep_output_dir,
         save_dir=save_dir,
+        max_workers = 8
     )
 
 if __name__ == "__main__":
