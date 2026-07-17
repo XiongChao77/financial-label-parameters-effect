@@ -65,7 +65,8 @@ class LabelRatioCurveAnalyzer:
             output_dir,
             "regime_discovery_output",
             f"{para.symbol}_{para.interval}",
-            f"{self.label_type}_{self.para_type}_label_ratio_curves",
+            para.label_type,
+            para.para_type,
         )
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -265,7 +266,80 @@ class LabelRatioCurveAnalyzer:
             upper = min(upper, max_upper)
 
         return lower, upper
-        
+
+    @staticmethod
+    def _find_crossings(x, y_a, y_b, max_points=2):
+        """
+        Find where curve y_a crosses curve y_b, walking left to right along x.
+
+        Uses linear interpolation between the two samples that bracket a sign
+        change of (y_a - y_b), so the reported x_cross is not restricted to
+        the discrete sample grid. Also handles the (rare) case where a sample
+        lands exactly on the crossing (diff == 0).
+
+        Only the first `max_points` crossings are returned (ordered by x),
+        since higher-order crossings on noisy curves (e.g. a second
+        derivative) tend to be numerical noise rather than meaningful
+        structure.
+
+        Returns
+        -------
+        list of dict, each with keys: x, y, index_left (the sample index
+        immediately before the crossing, useful for debugging/reporting).
+        """
+        x = np.asarray(x, dtype=float)
+        y_a = np.asarray(y_a, dtype=float)
+        y_b = np.asarray(y_b, dtype=float)
+
+        diff = y_a - y_b
+        finite = np.isfinite(diff) & np.isfinite(x)
+
+        crossings = []
+        idx = np.where(finite)[0]
+
+        for k in range(len(idx) - 1):
+            i0, i1 = idx[k], idx[k + 1]
+            d0, d1 = diff[i0], diff[i1]
+
+            if d0 == 0.0:
+                crossings.append({"x": float(x[i0]), "y": float(y_a[i0]), "index_left": int(i0)})
+            elif d0 * d1 < 0.0:
+                t = d0 / (d0 - d1)  # fraction of the way from i0 to i1 where diff hits 0
+                x_c = x[i0] + t * (x[i1] - x[i0])
+                y_c = y_a[i0] + t * (y_a[i1] - y_a[i0])
+                crossings.append({"x": float(x_c), "y": float(y_c), "index_left": int(i0)})
+
+            if len(crossings) >= max_points:
+                break
+
+        return crossings[:max_points]
+
+    def _annotate_crossings(self, ax, crossings, color="black", prefix=""):
+        """
+        Draw a marker + vertical guide line + text label for each crossing
+        point found by `_find_crossings`. Only meant to decorate up to 2
+        points, so labels are kept short ("1st crossing" / "2nd crossing").
+        """
+        ordinal_labels = ["1st crossing", "2nd crossing"]
+        offsets = [(12, 14), (12, -22)]  # avoid overlapping text for close points
+
+        for i, c in enumerate(crossings[:2]):
+            label = f"{prefix}{ordinal_labels[i]}\nx={c['x']:.3f}"
+            ax.axvline(c["x"], color=color, linestyle=":", linewidth=1.1, alpha=0.6)
+            ax.scatter(
+                [c["x"]], [c["y"]],
+                s=70, color=color, edgecolor="black", linewidth=0.8, zorder=5,
+            )
+            ax.annotate(
+                label,
+                xy=(c["x"], c["y"]),
+                xytext=offsets[i],
+                textcoords="offset points",
+                fontsize=9,
+                color=color,
+                arrowprops=dict(arrowstyle="->", color=color, alpha=0.8),
+            )
+
     def _curve_data(self, df_plot, empirical_col, gaussian_col, smooth_window):
         x = df_plot["x"].to_numpy(dtype=float)
         empirical = self._smooth(df_plot[empirical_col].to_numpy(dtype=float), smooth_window)
@@ -307,6 +381,7 @@ class LabelRatioCurveAnalyzer:
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
+        annotate_crossings=True,
     ):
         """
         Generate 9 plots:
@@ -337,6 +412,7 @@ class LabelRatioCurveAnalyzer:
             output_dir=output_dir,
             smooth_window=smooth_window,
             include_gaussian=include_gaussian,
+            annotate_crossings=annotate_crossings,
         )
 
         saved_paths["neutral"] = self.plot_single_label_ratio_curve(
@@ -345,6 +421,7 @@ class LabelRatioCurveAnalyzer:
             output_dir=output_dir,
             smooth_window=smooth_window,
             include_gaussian=include_gaussian,
+            annotate_crossings=annotate_crossings,
         )
 
         overview_path = self.plot_distribution_overview(
@@ -365,6 +442,7 @@ class LabelRatioCurveAnalyzer:
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
+        annotate_crossings=True,
     ):
         """Plot ratio, first derivative, and second derivative for one class."""
         if output_dir is None:
@@ -384,8 +462,9 @@ class LabelRatioCurveAnalyzer:
             smooth_window=smooth_window,
         )
 
-        prefix = f"{self.label_type}_{self.para_type}_{class_name}"
+        prefix = f"{class_name}"
         saved = {}
+        crossings_summary = []
 
         ratio_y_lim = self._auto_ylim(
             empirical,
@@ -396,7 +475,7 @@ class LabelRatioCurveAnalyzer:
             max_upper=1.05,
         )
 
-        saved["ratio"] = self._plot_two_curves(
+        saved["ratio"], crossings = self._plot_two_curves(
             x=x,
             y_emp=empirical,
             y_gau=gaussian,
@@ -408,9 +487,11 @@ class LabelRatioCurveAnalyzer:
             color=cfg["color"],
             include_gaussian=include_gaussian,
             y_lim=ratio_y_lim,
+            annotate_crossings=annotate_crossings,
         )
+        crossings_summary.append({"curve": "ratio", "crossings": crossings})
 
-        saved["first_derivative"] = self._plot_two_curves(
+        saved["first_derivative"], crossings = self._plot_two_curves(
             x=x,
             y_emp=d1_emp,
             y_gau=d1_gau,
@@ -422,9 +503,11 @@ class LabelRatioCurveAnalyzer:
             color=cfg["color"],
             include_gaussian=include_gaussian,
             add_zero_line=True,
+            annotate_crossings=annotate_crossings,
         )
+        crossings_summary.append({"curve": "first_derivative", "crossings": crossings})
 
-        saved["second_derivative"] = self._plot_two_curves(
+        saved["second_derivative"], crossings = self._plot_two_curves(
             x=x,
             y_emp=d2_emp,
             y_gau=d2_gau,
@@ -436,10 +519,15 @@ class LabelRatioCurveAnalyzer:
             color=cfg["color"],
             include_gaussian=include_gaussian,
             add_zero_line=True,
+            annotate_crossings=annotate_crossings,
+        )
+        crossings_summary.append({"curve": "second_derivative", "crossings": crossings})
+
+        self._save_crossings_csv(
+            crossings_summary, output_dir, prefix=f"{prefix}_crossings"
         )
 
         return saved
-
 
     def plot_positive_negative_ratio_curves(
         self,
@@ -447,6 +535,7 @@ class LabelRatioCurveAnalyzer:
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
+        annotate_crossings=True,
     ):
         """
         Plot positive and negative label-ratio curves together.
@@ -505,8 +594,9 @@ class LabelRatioCurveAnalyzer:
         d1_gaussian = pos_d1_gau
         d2_gaussian = pos_d2_gau
 
-        prefix = f"{self.label_type}_{self.para_type}_positive_negative"
+        prefix = f"positive_negative"
         saved = {}
+        crossings_summary = []
 
         ratio_y_lim = self._auto_ylim(
             pos_emp,
@@ -518,7 +608,7 @@ class LabelRatioCurveAnalyzer:
             max_upper=1.05,
         )
 
-        saved["ratio"] = self._plot_positive_negative_with_gaussian(
+        saved["ratio"], crossings = self._plot_positive_negative_with_gaussian(
             x=x,
             y_pos=pos_emp,
             y_neg=neg_emp,
@@ -527,9 +617,11 @@ class LabelRatioCurveAnalyzer:
             ylabel="Label ratio",
             output_path=os.path.join(output_dir, f"{prefix}_ratio.png"),
             y_lim=ratio_y_lim,
+            annotate_crossings=annotate_crossings,
         )
+        crossings_summary.append({"curve": "ratio", "crossings": crossings})
 
-        saved["first_derivative"] = self._plot_positive_negative_with_gaussian(
+        saved["first_derivative"], crossings = self._plot_positive_negative_with_gaussian(
             x=x,
             y_pos=pos_d1_emp,
             y_neg=neg_d1_emp,
@@ -538,9 +630,11 @@ class LabelRatioCurveAnalyzer:
             ylabel="First derivative",
             output_path=os.path.join(output_dir, f"{prefix}_d1.png"),
             add_zero_line=True,
+            annotate_crossings=annotate_crossings,
         )
+        crossings_summary.append({"curve": "first_derivative", "crossings": crossings})
 
-        saved["second_derivative"] = self._plot_positive_negative_with_gaussian(
+        saved["second_derivative"], crossings = self._plot_positive_negative_with_gaussian(
             x=x,
             y_pos=pos_d2_emp,
             y_neg=neg_d2_emp,
@@ -549,6 +643,12 @@ class LabelRatioCurveAnalyzer:
             ylabel="Second derivative",
             output_path=os.path.join(output_dir, f"{prefix}_d2.png"),
             add_zero_line=True,
+            annotate_crossings=annotate_crossings,
+        )
+        crossings_summary.append({"curve": "second_derivative", "crossings": crossings})
+
+        self._save_crossings_csv(
+            crossings_summary, output_dir, prefix=f"{prefix}_crossings"
         )
 
         return saved
@@ -607,7 +707,7 @@ class LabelRatioCurveAnalyzer:
 
         output_path = os.path.join(
             output_dir,
-            f"{self.label_type}_{self.para_type}_distribution_overview.png",
+            f"distribution_overview.png",
         )
         plt.savefig(output_path, dpi=250, bbox_inches="tight")
         plt.close()
@@ -628,6 +728,7 @@ class LabelRatioCurveAnalyzer:
         include_gaussian=True,
         y_lim=None,
         add_zero_line=False,
+        annotate_crossings=True,
     ):
         fig, ax = plt.subplots(figsize=(12, 7))
 
@@ -641,6 +742,7 @@ class LabelRatioCurveAnalyzer:
             label=empirical_label,
         )
 
+        crossings = []
         if include_gaussian:
             ax.plot(
                 x,
@@ -651,6 +753,10 @@ class LabelRatioCurveAnalyzer:
                 alpha=0.8,
                 label=gaussian_label,
             )
+
+            if annotate_crossings:
+                crossings = self._find_crossings(x, y_emp, y_gau, max_points=2)
+                self._annotate_crossings(ax, crossings, color="tab:blue")
 
         if add_zero_line:
             ax.axhline(0.0, color="black", linestyle=":", alpha=0.5)
@@ -670,7 +776,10 @@ class LabelRatioCurveAnalyzer:
         plt.savefig(output_path, dpi=250, bbox_inches="tight")
         plt.close()
         print(f"✅ Plot saved: {output_path}")
-        return output_path
+        if crossings:
+            xs = ", ".join(f"{c['x']:.3f}" for c in crossings)
+            # print(f"   ↳ crossing x-values (first {len(crossings)}): {xs}")
+        return output_path, crossings
 
     def _plot_positive_negative_with_gaussian(
         self,
@@ -683,6 +792,7 @@ class LabelRatioCurveAnalyzer:
         output_path,
         y_lim=None,
         add_zero_line=False,
+        annotate_crossings=True,
     ):
         fig, ax = plt.subplots(figsize=(12, 7))
 
@@ -706,15 +816,27 @@ class LabelRatioCurveAnalyzer:
             label="Negative empirical",
         )
 
-        ax.plot(
-            x,
-            y_gau,
-            linestyle="--",
-            linewidth=2.0,
-            color="black",
-            alpha=0.8,
-            label="Gaussian reference",
-        )
+        crossings = {"positive_vs_gaussian": [], "negative_vs_gaussian": []}
+
+        if y_gau is not None:
+            ax.plot(
+                x,
+                y_gau,
+                linestyle="--",
+                linewidth=2.0,
+                color="black",
+                alpha=0.8,
+                label="Gaussian reference",
+            )
+
+            if annotate_crossings:
+                pos_crossings = self._find_crossings(x, y_pos, y_gau, max_points=2)
+                neg_crossings = self._find_crossings(x, y_neg, y_gau, max_points=2)
+                crossings["positive_vs_gaussian"] = pos_crossings
+                crossings["negative_vs_gaussian"] = neg_crossings
+
+                self._annotate_crossings(ax, pos_crossings, color="darkgreen", prefix="Pos ")
+                self._annotate_crossings(ax, neg_crossings, color="darkred", prefix="Neg ")
 
         if add_zero_line:
             ax.axhline(0.0, color="black", linestyle=":", alpha=0.5)
@@ -737,4 +859,56 @@ class LabelRatioCurveAnalyzer:
         plt.close()
 
         print(f"✅ Plot saved: {output_path}")
-        return output_path
+        if crossings["positive_vs_gaussian"]:
+            xs = ", ".join(f"{c['x']:.3f}" for c in crossings["positive_vs_gaussian"])
+            # print(f"   ↳ positive-vs-Gaussian crossing x-values: {xs}")
+        if crossings["negative_vs_gaussian"]:
+            xs = ", ".join(f"{c['x']:.3f}" for c in crossings["negative_vs_gaussian"])
+            # print(f"   ↳ negative-vs-Gaussian crossing x-values: {xs}")
+        return output_path, crossings
+
+    @staticmethod
+    def _save_crossings_csv(crossings_summary, output_dir, prefix):
+        """
+        Flatten the crossings collected across a group of plots (ratio/d1/d2,
+        possibly split by positive/negative) into one tidy CSV for reporting
+        in the dissertation, instead of only relying on the annotated PNGs.
+        """
+        rows = []
+        for entry in crossings_summary:
+            curve_name = entry["curve"]
+            c = entry["crossings"]
+
+            if isinstance(c, dict):
+                # positive/negative split: {"positive_vs_gaussian": [...], "negative_vs_gaussian": [...]}
+                for series_name, points in c.items():
+                    for order, point in enumerate(points, start=1):
+                        rows.append(
+                            {
+                                "curve": curve_name,
+                                "series": series_name,
+                                "crossing_order": order,
+                                "x": point["x"],
+                                "y": point["y"],
+                            }
+                        )
+            else:
+                # single empirical-vs-gaussian list
+                for order, point in enumerate(c, start=1):
+                    rows.append(
+                        {
+                            "curve": curve_name,
+                            "series": "empirical_vs_gaussian",
+                            "crossing_order": order,
+                            "x": point["x"],
+                            "y": point["y"],
+                        }
+                    )
+
+        if not rows:
+            return None
+
+        out_path = os.path.join(output_dir, f"{prefix}.csv")
+        pd.DataFrame(rows).to_csv(out_path, index=False)
+        print(f"✅ Crossings summary saved: {out_path}")
+        return out_path

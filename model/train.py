@@ -10,9 +10,13 @@ Fixed Neutral Subsampling Experiment (Probe)
   2) Flatten X only once; cache flattened test set; avoid repeated reshape inside the loop
   3) No GPU preload (sklearn runs on CPU)
   4) Remove unrelated model configs / training pipeline / samplers, etc.
+  5) Randomize per-run model training order to spread out LSTM GPU usage across processes
+  6) Free GPU memory once an entire LSTM stage (all label_cols) finishes for a run
+  7) Dynamically probe current GPU memory usage before an LSTM stage and fall back
+     to CPU training if there isn't enough headroom, instead of a hardcoded concurrency cap
 """
 
-import os,sys,re
+import os,sys,re,json
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -33,18 +37,25 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import f1_score, matthews_corrcoef, accuracy_score, balanced_accuracy_score, precision_recall_fscore_support
 from sklearn.exceptions import ConvergenceWarning
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-import copy
+import copy, shutil
+
+try:
+    import pynvml
+    _PYNVML_AVAILABLE = True
+except ImportError:
+    _PYNVML_AVAILABLE = False
 
 current_work_dir = os.path.dirname(__file__)
 sys.path.append(os.path.join(current_work_dir, ".."))
+sys.path.append(current_work_dir)  # ensure plot_results.py (same dir) is importable regardless of CWD
 from data_process import common
 from model.data_loader import TimeSeriesWindowDataset
 from model.train_config import *
 from model.models import lstm
+from analysis import plot_results  # decoupled plotting module: reads persisted summary CSVs / writes figures
+from analysis import compose_report_images
 
 @dataclass
 class DataConfig:
@@ -750,1221 +761,35 @@ def compute_financial_returns_with_exit_index_vectorized(
 
     return results
 
-def generate_random_predictions(n: int, seed: int) -> np.ndarray:
+def generate_random_predictions(n: int, seed: int, p: np.ndarray = None) -> np.ndarray:
+    """
+    Random-guess baseline predictions.
+
+    p=None -> uniform over the 3 classes (1/3 each).
+    p=[p_pos, p_neg, p_neu] -> sample according to given class probabilities.
+    """
     rng = np.random.default_rng(seed)
     return rng.choice(
-        [common.Signal.POSITIVE,common.Signal.NEGATIVE,common.Signal.NEUTRAL,],
+        [common.Signal.POSITIVE, common.Signal.NEGATIVE, common.Signal.NEUTRAL],
         size=int(n),
-        replace=True,).astype(np.int64)
+        replace=True,
+        p=p,
+    ).astype(np.int64)
 
-def plot_cross_eval_heatmap(
-    cross_df: pd.DataFrame,
-    save_dir: str,
-    metric: str,
-    annotate_std: bool = True,
-    para_type:str = "volatility",
-) -> List[str]:
+
+def compute_class_proportions(y: np.ndarray) -> np.ndarray:
     """
-    Plot cross-evaluation mean/std heatmaps.
-
-    Expected input:
-        cross_matrix_summary_df with columns:
-        model, eval_mode, train_threshold, eval_threshold,
-        {metric}_mean, {metric}_std
+    Empirical class proportions [p_pos, p_neg, p_neu] of `y`, in the same
+    class order used by generate_random_predictions. Falls back to uniform
+    if `y` is empty (shouldn't normally happen).
     """
+    classes = [common.Signal.POSITIVE, common.Signal.NEGATIVE, common.Signal.NEUTRAL]
+    counts = np.array([np.sum(y == c) for c in classes], dtype=float)
+    total = counts.sum()
+    if total <= 0:
+        return np.full(len(classes), 1.0 / len(classes))
+    return counts / total
 
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    mean_col = f"{metric}_mean"
-    std_col = f"{metric}_std"
-
-    required_cols = [
-        "model",
-        "eval_mode",
-        "train_threshold",
-        "eval_threshold",
-        mean_col,
-        std_col,
-    ]
-    missing = [c for c in required_cols if c not in cross_df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    saved_paths = []
-
-    for (model_name, eval_mode), curr_df in cross_df.groupby(["model", "eval_mode"]):
-        curr_save_dir = os.path.join(save_dir, str(model_name))
-        os.makedirs(curr_save_dir, exist_ok=True)
-
-        # Avoid pivot errors
-        duplicated = curr_df.duplicated(
-            ["train_threshold", "eval_threshold"],
-            keep=False,
-        )
-        if duplicated.any():
-            raise ValueError(
-                f"Duplicate train/eval threshold pairs found for "
-                f"model={model_name}, eval_mode={eval_mode}"
-            )
-
-        mean_pivot = (
-            curr_df
-            .pivot(
-                index="train_threshold",
-                columns="eval_threshold",
-                values=mean_col,
-            )
-            .sort_index()
-            .sort_index(axis=1)
-        )
-
-        std_pivot = (
-            curr_df
-            .pivot(
-                index="train_threshold",
-                columns="eval_threshold",
-                values=std_col,
-            )
-            .reindex(index=mean_pivot.index, columns=mean_pivot.columns)
-        )
-
-        def add_mean_row_col(pivot: pd.DataFrame):
-            values = pivot.values.astype(float)
-
-            row_mean = np.nanmean(values, axis=1, keepdims=True)
-            col_mean = np.nanmean(values, axis=0, keepdims=True)
-            overall_mean = np.nanmean(values)
-
-            values_with_mean = np.block([
-                [values, row_mean],
-                [col_mean, np.array([[overall_mean]])],
-            ])
-
-            row_labels = [f"{x:.1f}" for x in pivot.index] + ["Mean"]
-            col_labels = [f"{x:.1f}" for x in pivot.columns] + ["Mean"]
-
-            return values_with_mean, row_labels, col_labels
-
-        mean_values, row_labels, col_labels = add_mean_row_col(mean_pivot)
-        std_values, _, _ = add_mean_row_col(std_pivot)
-
-        n_rows, n_cols = mean_values.shape
-        fig_width = max(10, n_cols * 0.55)
-        fig_height = max(8, n_rows * 0.45)
-
-        # =====================================================
-        # Mean heatmap
-        # =====================================================
-        vmin = np.nanmin(mean_pivot.values.astype(float))
-        vmax = np.nanmax(mean_pivot.values.astype(float))
-
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-        im = ax.imshow(
-            mean_values,
-            aspect="auto",
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        ax.set_xticks(np.arange(n_cols))
-        ax.set_xticklabels(col_labels, rotation=45, ha="right")
-        ax.set_yticks(np.arange(n_rows))
-        ax.set_yticklabels(row_labels)
-
-        if para_type == 'volatility':
-            label = "Threshold λ"
-        elif para_type == 'horizon':
-            label = "Bar horizon h"
-        ax.set_xlabel(f"Eval Label {label}")
-        ax.set_ylabel(f"Train Label {label}")
-        ax.set_title(
-            f"Cross Evaluation Mean {metric.upper()}\n"
-            f"Model={model_name}, Eval={eval_mode}"
-        )
-
-        # Grid
-        ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
-        ax.grid(which="minor", linewidth=0.5, alpha=0.5)
-        ax.tick_params(which="minor", bottom=False, left=False)
-
-        fontsize = 7 if max(n_rows, n_cols) > 20 else 8
-
-        for i in range(n_rows):
-            for j in range(n_cols):
-                mean_val = mean_values[i, j]
-                std_val = std_values[i, j]
-
-                if np.isnan(mean_val):
-                    text = ""
-                elif annotate_std:
-                    text = f"{mean_val:.5f}\n±{std_val:.5f}"
-                else:
-                    text = f"{mean_val:.5f}"
-
-                ax.text(
-                    j,
-                    i,
-                    text,
-                    ha="center",
-                    va="center",
-                    fontsize=fontsize,
-                    color="black",
-                )
-
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        plt.tight_layout()
-
-        mean_out_path = os.path.join(
-            curr_save_dir,
-            f"cross_eval_{metric}_{eval_mode}_mean_heatmap.png",
-        )
-        plt.savefig(mean_out_path, dpi=220)
-        plt.close()
-        saved_paths.append(mean_out_path)
-
-        # =====================================================
-        # Std heatmap
-        # =====================================================
-        std_vmin = np.nanmin(std_pivot.values.astype(float))
-        std_vmax = np.nanmax(std_pivot.values.astype(float))
-
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-
-        im = ax.imshow(
-            std_values,
-            aspect="auto",
-            vmin=std_vmin,
-            vmax=std_vmax,
-        )
-
-        ax.set_xticks(np.arange(n_cols))
-        ax.set_xticklabels(col_labels, rotation=45, ha="right")
-        ax.set_yticks(np.arange(n_rows))
-        ax.set_yticklabels(row_labels)
-
-        ax.set_xlabel("Eval Label Threshold λ")
-        ax.set_ylabel("Train Label Threshold λ")
-        ax.set_title(
-            f"Cross Evaluation Std {metric.upper()}\n"
-            f"Model={model_name}, Eval={eval_mode}"
-        )
-
-        ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
-        ax.grid(which="minor", linewidth=0.5, alpha=0.5)
-        ax.tick_params(which="minor", bottom=False, left=False)
-
-        for i in range(n_rows):
-            for j in range(n_cols):
-                val = std_values[i, j]
-                text = "" if np.isnan(val) else f"{val:.3f}"
-
-                ax.text(
-                    j,
-                    i,
-                    text,
-                    ha="center",
-                    va="center",
-                    fontsize=fontsize,
-                    color="black",
-                )
-
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        plt.tight_layout()
-
-        std_out_path = os.path.join(
-            curr_save_dir,
-            f"cross_eval_{metric}_{eval_mode}_std_heatmap.png",
-        )
-        plt.savefig(std_out_path, dpi=220)
-        plt.close()
-        saved_paths.append(std_out_path)
-
-    return saved_paths
-
-def plot_self_eval_mean_std(
-    self_summary_df: pd.DataFrame,
-    save_dir: str,
-    metric: str = "macro_f1",
-    para_type:str = "volatility",
-) -> list[str]:
-
-    mean_col = f"{metric}_mean"
-    std_col = f"{metric}_std"
-
-    out_paths = []
-
-    for model_name, df_one in self_summary_df.groupby("model", dropna=False):
-        model_save_dir = os.path.join(save_dir, model_name)
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("threshold").copy()
-
-        x = df_plot["threshold"].to_numpy()
-        y = df_plot[mean_col].to_numpy()
-        y_std = df_plot[std_col].fillna(0).to_numpy()
-
-        if len(x) == 0:
-            continue
-
-        train_size = int(df_plot["train_size"].iloc[0])
-        test_size = int(df_plot["test_size"].iloc[0])
-        total_runs = int(df_plot["n_runs"].max())
-
-        info = (
-            f"{total_runs} independent runs\n"
-            f"train samples = {train_size}\n"
-            f"test samples = {test_size}"
-        )
-
-        plt.figure(figsize=(10, 6))
-
-        plt.plot(
-            x,
-            y,
-            marker="o",
-            linewidth=2,
-            label=f"{metric} mean",
-        )
-
-        plt.fill_between(
-            x,
-            y - y_std,
-            y + y_std,
-            alpha=0.2,
-            label="±1 std across runs",
-        )
-
-        best_i = int(np.nanargmax(y))
-
-        plt.scatter([x[best_i]], [y[best_i]], s=120)
-
-        plt.axvline(
-            x=x[best_i],
-            linestyle="--",
-            alpha=0.5,
-        )
-
-        plt.annotate(
-            f"Best λ={x[best_i]:.1f}\n{metric}={y[best_i]:.4f}",
-            xy=(x[best_i], y[best_i]),
-            xytext=(10, 10),
-            textcoords="offset points",
-            arrowprops=dict(arrowstyle="->"),
-        )
-
-        plt.title(
-            f"Self Evaluation: {metric.upper()} Mean ± Std\n"
-            f"Model={model_name}"
-        )
-
-        if para_type == 'volatility':
-            plt.xlabel("Label Threshold Multiplier λ")
-        elif para_type == 'horizon':    
-            plt.xlabel("Label bar horizon h")
-        plt.ylabel(metric.upper())
-
-        plt.grid(True, alpha=0.3)
-
-        handles, labels = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"self_eval_{metric}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-        out_paths.append(out_path)
-
-    return out_paths
-
-def plot_financial_return_mean_std(
-    financial_summary_df: pd.DataFrame,
-    save_dir: str,
-    metric: str,
-    para_type: str = "volatility",
-) -> list[str]:
-    """
-    Plot threshold-financial metric mean/std curves.
-
-    Real models:
-        - plot mean curve
-        - plot ±1 std band
-
-    RandomPredict:
-        - used only as baseline
-        - overlaid on each real model figure
-        - plot mean curve only
-        - no std band
-        - no separate RandomPredict figure
-    """
-
-    mean_col = f"{metric}_mean"
-    std_col = f"{metric}_std"
-
-    required_cols = [
-        "model",
-        "fee_rate",
-        "threshold",
-        mean_col,
-        std_col,
-        "n_runs",
-        "test_size",
-    ]
-
-    missing = [c for c in required_cols if c not in financial_summary_df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns for financial plot: {missing}")
-
-    out_paths = []
-
-    # Split RandomPredict from real models.
-    random_df = financial_summary_df[
-        financial_summary_df["model"] == "RandomPredict"
-    ].copy()
-
-    real_df = financial_summary_df[
-        financial_summary_df["model"] != "RandomPredict"
-    ].copy()
-
-    for (model_name, fee_rate), df_one in real_df.groupby(
-        ["model", "fee_rate"],
-        dropna=False,
-    ):
-        model_save_dir = os.path.join(save_dir, str(model_name), "financial_return")
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("threshold").copy()
-
-        x = df_plot["threshold"].to_numpy(dtype=float)
-        y = df_plot[mean_col].to_numpy(dtype=float)
-        y_std = df_plot[std_col].fillna(0).to_numpy(dtype=float)
-
-        if len(x) == 0:
-            continue
-
-        test_size = int(df_plot["test_size"].iloc[0])
-        n_runs = int(df_plot["n_runs"].max())
-
-        info = (
-            f"{n_runs} independent runs\n"
-            f"test samples = {test_size}\n"
-            f"fee_rate = {fee_rate:.6f}"
-        )
-
-        plt.figure(figsize=(10, 6))
-
-        # =====================================================
-        # Real model: mean + std
-        # =====================================================
-        plt.plot(
-            x,
-            y,
-            marker="o",
-            linewidth=2,
-            label=f"{model_name} {metric} mean",
-        )
-
-        plt.fill_between(
-            x,
-            y - y_std,
-            y + y_std,
-            alpha=0.2,
-            label=f"{model_name} ±1 std",
-        )
-
-        # =====================================================
-        # RandomPredict baseline: mean only, no std
-        # =====================================================
-        random_one = random_df[
-            random_df["fee_rate"] == fee_rate
-        ].sort_values("threshold")
-
-        if len(random_one) > 0:
-            x_random = random_one["threshold"].to_numpy(dtype=float)
-            y_random = random_one[mean_col].to_numpy(dtype=float)
-
-            plt.plot(
-                x_random,
-                y_random,
-                marker="x",
-                linewidth=2,
-                linestyle="--",
-                label="RandomPredict baseline mean",
-            )
-
-        # Mark best point of the real model only.
-        if np.any(np.isfinite(y)):
-            best_i = int(np.nanargmax(y))
-
-            plt.scatter([x[best_i]], [y[best_i]], s=120)
-
-            plt.axvline(
-                x=x[best_i],
-                linestyle="--",
-                alpha=0.5,
-            )
-
-            plt.annotate(
-                f"Best λ={x[best_i]:.1f}\n{metric}={y[best_i]:.6f}",
-                xy=(x[best_i], y[best_i]),
-                xytext=(10, 10),
-                textcoords="offset points",
-                arrowprops=dict(arrowstyle="->"),
-            )
-
-        plt.axhline(0.0, linestyle="--", linewidth=1, alpha=0.6)
-
-        plt.title(
-            f"Financial Diagnostic: {metric}\n"
-            f"Model={model_name}, Fee={fee_rate:.6f}"
-        )
-
-        if para_type == "volatility":
-            plt.xlabel("Label Threshold Multiplier λ")
-        elif para_type == "horizon":
-            plt.xlabel("Label bar horizon h")
-
-        plt.ylabel(metric)
-        plt.grid(True, alpha=0.3)
-
-        handles, _ = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"financial_{metric}_fee_{fee_rate:.6f}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-        out_paths.append(out_path)
-
-    return out_paths
-
-def plot_financial_three_means(
-    financial_summary_df: pd.DataFrame,
-    save_dir: str,
-    para_type: str = "volatility",
-    random_metric: str = "strategy_total_return_mean",
-) -> list[str]:
-    """
-    Financial three-in-one plot.
-
-    For each real model + fee_rate, generate one figure with:
-    1) signal_avg_return_mean
-    2) strategy_total_return_mean
-    3) RandomPredict baseline mean
-
-    random_metric:
-        - "strategy_total_return_mean"  -> use RandomPredict strategy mean
-        - "signal_avg_return_mean"      -> use RandomPredict signal mean
-    """
-
-    required_cols = [
-        "model",
-        "fee_rate",
-        "threshold",
-        "n_runs",
-        "test_size",
-        "signal_avg_return_mean",
-        "strategy_total_return_mean",
-    ]
-
-    missing = [c for c in required_cols if c not in financial_summary_df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns for financial three-metric plot: {missing}")
-
-    if random_metric not in ["strategy_total_return_mean", "signal_avg_return_mean"]:
-        raise ValueError(
-            f"Unsupported random_metric={random_metric}. "
-            f"Expected 'strategy_total_return_mean' or 'signal_avg_return_mean'."
-        )
-
-    out_paths = []
-
-    random_df = financial_summary_df[
-        financial_summary_df["model"] == "RandomPredict"
-    ].copy()
-
-    real_df = financial_summary_df[
-        financial_summary_df["model"] != "RandomPredict"
-    ].copy()
-
-    for (model_name, fee_rate), df_one in real_df.groupby(
-        ["model", "fee_rate"],
-        dropna=False,
-    ):
-        model_save_dir = os.path.join(save_dir, str(model_name), "financial_return")
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("threshold").copy()
-
-        if len(df_plot) == 0:
-            continue
-
-        x = df_plot["threshold"].to_numpy(dtype=float)
-        y_signal = df_plot["signal_avg_return_mean"].to_numpy(dtype=float)
-        y_strategy = df_plot["strategy_total_return_mean"].to_numpy(dtype=float)
-
-        test_size = int(df_plot["test_size"].iloc[0])
-        n_runs = int(df_plot["n_runs"].max())
-
-        info = (
-            f"{n_runs} independent runs\n"
-            f"test samples = {test_size}\n"
-            f"fee_rate = {fee_rate:.6f}"
-        )
-
-        plt.figure(figsize=(10, 6))
-
-        # 1) real model signal mean
-        plt.plot(
-            x,
-            y_signal,
-            marker="o",
-            linewidth=2,
-            label="Signal avg return mean",
-        )
-
-        # 2) real model strategy mean
-        plt.plot(
-            x,
-            y_strategy,
-            marker="s",
-            linewidth=2,
-            label="Strategy total return mean",
-        )
-
-        # 3) random baseline mean
-        random_one = random_df[
-            random_df["fee_rate"] == fee_rate
-        ].sort_values("threshold")
-
-        if len(random_one) > 0 and random_metric in random_one.columns:
-            x_random = random_one["threshold"].to_numpy(dtype=float)
-            y_random = random_one[random_metric].to_numpy(dtype=float)
-
-            random_label = (
-                "RandomPredict strategy mean"
-                if random_metric == "strategy_total_return_mean"
-                else "RandomPredict signal mean"
-            )
-
-            plt.plot(
-                x_random,
-                y_random,
-                marker="x",
-                linewidth=2,
-                linestyle="--",
-                label=random_label,
-            )
-
-        plt.axhline(0.0, linestyle="--", linewidth=1, alpha=0.6)
-
-        plt.title(
-            f"Financial Summary: Signal / Strategy / Random\n"
-            f"Model={model_name}, Fee={fee_rate:.6f}"
-        )
-
-        if para_type == "volatility":
-            plt.xlabel("Label Threshold Multiplier λ")
-        elif para_type == "horizon":
-            plt.xlabel("Label bar horizon h")
-        else:
-            plt.xlabel("Label parameter")
-
-        plt.ylabel("Return")
-        plt.grid(True, alpha=0.3)
-
-        handles, _ = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"financial_three_means_fee_{fee_rate:.6f}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-        out_paths.append(out_path)
-
-    return out_paths
-
-def plot_cross_train_batch_summary(
-    cross_train_batch_summary_df,
-    save_dir,
-    metric: str,
-    total_runs,
-    para_type:str = "volatility",
-):
-    mean_col = f"{metric}_mean_mean"
-    std_col = f"{metric}_mean_std"
-
-    for (model, eval_mode), df_one in cross_train_batch_summary_df.groupby(
-        ["model", "eval_mode"]
-    ):
-        model_save_dir = os.path.join(save_dir, model)
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("train_threshold").copy()
-
-        x = df_plot["train_threshold"].to_numpy()
-        y = df_plot[mean_col].to_numpy()
-        y_std = df_plot[std_col].fillna(0).to_numpy()
-
-        if len(x) == 0:
-            continue
-
-        train_size = int(df_plot["train_size"].iloc[0])
-        test_size = int(df_plot["test_size"].iloc[0])
-
-        info = (
-            f"{total_runs} independent runs\n"
-            f"train samples = {train_size}\n"
-            f"test samples = {test_size}"
-        )
-
-        plt.figure(figsize=(10, 6))
-
-        plt.plot(
-            x,
-            y,
-            marker="o",
-            linewidth=2,
-            label=f"{metric} mean",
-        )
-
-        plt.fill_between(
-            x,
-            y - y_std,
-            y + y_std,
-            alpha=0.2,
-            label="±1 std across runs",
-        )
-
-        best_i = int(np.nanargmax(y))
-
-        plt.scatter([x[best_i]], [y[best_i]], s=120)
-
-        plt.annotate(
-            f"Best λ={x[best_i]:.1f}\n{metric}={y[best_i]:.4f}",
-            xy=(x[best_i], y[best_i]),
-            xytext=(10, 10),
-            textcoords="offset points",
-            arrowprops=dict(arrowstyle="->"),
-        )
-
-        plt.title(
-            f"Train Threshold Robustness\n"
-            f"Model={model}, Eval={eval_mode}"
-        )
-
-        if para_type == 'volatility':
-            plt.xlabel("Label Train Threshold Multiplier λ")
-        elif para_type == 'horizon':    
-            plt.xlabel("Label Train bar horizon h")
-        plt.ylabel(metric.upper())
-
-        plt.grid(True, alpha=0.3)
-
-        handles, labels = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"cross_train_batch_{metric}_{model}_{eval_mode}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-def plot_cross_eval_batch_summary(
-    cross_eval_batch_summary_df,
-    save_dir,
-    metric: str,
-    total_runs,
-    para_type:str = "volatility",
-):
-    mean_col = f"{metric}_mean_mean"
-    std_col = f"{metric}_mean_std"
-
-    for (model, eval_mode), df_one in cross_eval_batch_summary_df.groupby(
-        ["model", "eval_mode"]
-    ):
-        model_save_dir = os.path.join(save_dir, model)
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("eval_threshold").copy()
-
-        x = df_plot["eval_threshold"].to_numpy()
-        y = df_plot[mean_col].to_numpy()
-        y_std = df_plot[std_col].fillna(0).to_numpy()
-
-        if len(x) == 0:
-            continue
-
-        train_size = int(df_plot["train_size"].iloc[0])
-        test_size = int(df_plot["test_size"].iloc[0])
-
-        info = (
-            f"{total_runs} independent runs\n"
-            f"train samples = {train_size}\n"
-            f"test samples = {test_size}"
-        )
-
-        plt.figure(figsize=(10, 6))
-
-        plt.plot(
-            x,
-            y,
-            marker="s",
-            linewidth=2,
-            linestyle="--",
-            label=f"{metric} mean",
-        )
-
-        plt.fill_between(
-            x,
-            y - y_std,
-            y + y_std,
-            alpha=0.2,
-            label="±1 std",
-        )
-
-        easiest_i = int(np.nanargmax(y))
-
-        plt.scatter([x[easiest_i]], [y[easiest_i]], s=120)
-
-        plt.annotate(
-            f"Easiest λ={x[easiest_i]:.1f}\n{metric}={y[easiest_i]:.4f}",
-            xy=(x[easiest_i], y[easiest_i]),
-            xytext=(10, -15),
-            textcoords="offset points",
-            arrowprops=dict(arrowstyle="->"),
-        )
-
-        plt.title(
-            f"Eval Threshold Separability\n"
-            f"Model={model}, Eval={eval_mode}"
-        )
-
-        if para_type == 'volatility':
-            plt.xlabel("Label Eval Threshold Multiplier λ")
-        elif para_type == 'horizon':    
-            plt.xlabel("Label Eval bar horizon h")
-        plt.ylabel(metric.upper())
-
-        plt.grid(True, alpha=0.3)
-
-        handles, labels = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"cross_eval_batch_{metric}_{model}_{eval_mode}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-def plot_train_vs_eval_summary(cross_train_batch_summary_df,cross_eval_batch_summary_df,save_dir,
-                                metric: str,total_runs,para_type:str = "volatility",):
-    mean_col = f"{metric}_mean_mean"
-
-    for model in sorted(cross_train_batch_summary_df["model"].unique()):
-        model_save_dir = os.path.join(save_dir, model)
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        for eval_mode in sorted(cross_train_batch_summary_df["eval_mode"].unique()):
-            train_df = cross_train_batch_summary_df.query(
-                "model == @model and eval_mode == @eval_mode"
-            ).sort_values("train_threshold")
-
-            eval_df = cross_eval_batch_summary_df.query(
-                "model == @model and eval_mode == @eval_mode"
-            ).sort_values("eval_threshold")
-
-            train_size = int(train_df["train_size"].iloc[0])
-            test_size = int(eval_df["test_size"].iloc[0])
-            info = (
-                f"{total_runs} independent runs\n"
-                f"train samples = {train_size}\n"
-                f"test samples = {test_size}"
-            )
-            fig, ax = plt.subplots(figsize=(12, 7))
-
-        if para_type == 'volatility':
-            label = "Threshold"
-        elif para_type == 'horizon':    
-            label = "Bar horizon"
-
-        ax.plot(
-            train_df["train_threshold"],
-            train_df[mean_col],
-            marker="o",
-            linewidth=3,
-            label=f"Train {label} Robustness",
-        )
-        ax.plot(
-            eval_df["eval_threshold"],
-            eval_df[mean_col],
-            marker="s",
-            linewidth=3,
-            linestyle="--",
-            label=f"Eval {label} Separability",
-        )
-
-        handles, _ = ax.get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-
-        ax.legend(handles=handles, loc="upper right", framealpha=0.9)
-        ax.set(
-            title=f"Train vs Eval Threshold Analysis\nModel={model}, Eval={eval_mode}",
-            xlabel="Threshold λ",
-            ylabel=metric.upper(),
-        )
-        ax.grid(True, alpha=0.3)
-
-        fig.tight_layout()
-        fig.savefig(
-            os.path.join(model_save_dir, f"train_vs_eval_{metric}_{model}_{eval_mode}.png"),
-            dpi=250,
-        )
-        plt.close(fig)
-
-def plot_self_eval_three_metrics(
-    self_summary_df: pd.DataFrame,
-    save_dir: str,
-    para_type: str = "volatility",
-) -> list[str]:
-    """
-    Self evaluation three-metric plot:
-    accuracy / macro_f1 / mcc in one figure.
-
-    Use mean curves only.
-    Existing single-metric mean±std figures are kept unchanged.
-    """
-
-    metrics = [
-        ("accuracy", "Accuracy"),
-        ("macro_f1", "Macro-F1"),
-        ("mcc", "MCC"),
-    ]
-
-    out_paths = []
-
-    for model_name, df_one in self_summary_df.groupby("model", dropna=False):
-        model_save_dir = os.path.join(save_dir, str(model_name))
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("threshold").copy()
-
-        if len(df_plot) == 0:
-            continue
-
-        x = df_plot["threshold"].to_numpy(dtype=float)
-
-        plt.figure(figsize=(10, 6))
-
-        for metric, label in metrics:
-            mean_col = f"{metric}_mean"
-
-            if mean_col not in df_plot.columns:
-                continue
-
-            y = df_plot[mean_col].to_numpy(dtype=float)
-
-            plt.plot(
-                x,
-                y,
-                marker="o",
-                linewidth=2,
-                label=label,
-            )
-
-        if para_type == "volatility":
-            xlabel = "Label Threshold Multiplier λ"
-        elif para_type == "horizon":
-            xlabel = "Label bar horizon h"
-        else:
-            xlabel = "Label parameter"
-
-        train_size = int(df_plot["train_size"].iloc[0])
-        test_size = int(df_plot["test_size"].iloc[0])
-        n_runs = int(df_plot["n_runs"].max())
-
-        info = (
-            f"{n_runs} independent runs\n"
-            f"train samples = {train_size}\n"
-            f"test samples = {test_size}"
-        )
-
-        plt.title(
-            f"Self Evaluation: Accuracy / Macro-F1 / MCC\n"
-            f"Model={model_name}"
-        )
-        plt.xlabel(xlabel)
-        plt.ylabel("Metric value")
-        plt.grid(True, alpha=0.3)
-
-        handles, _ = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            "self_eval_three_metrics.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-        out_paths.append(out_path)
-
-    return out_paths
-
-def plot_cross_train_three_metrics(
-    cross_train_batch_summary_df: pd.DataFrame,
-    save_dir: str,
-    total_runs: int,
-    para_type: str = "volatility",
-) -> list[str]:
-    """
-    Cross-train three-metric plot:
-    accuracy / macro_f1 / mcc in one figure.
-
-    One figure for each model + eval_mode.
-    eval_mode naturally distinguishes raw / balanced.
-    """
-
-    metrics = [
-        ("accuracy", "Accuracy"),
-        ("macro_f1", "Macro-F1"),
-        ("mcc", "MCC"),
-    ]
-
-    out_paths = []
-
-    for (model, eval_mode), df_one in cross_train_batch_summary_df.groupby(
-        ["model", "eval_mode"],
-        dropna=False,
-    ):
-        model_save_dir = os.path.join(save_dir, str(model))
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("train_threshold").copy()
-
-        if len(df_plot) == 0:
-            continue
-
-        x = df_plot["train_threshold"].to_numpy(dtype=float)
-
-        plt.figure(figsize=(10, 6))
-
-        for metric, label in metrics:
-            mean_col = f"{metric}_mean_mean"
-
-            if mean_col not in df_plot.columns:
-                continue
-
-            y = df_plot[mean_col].to_numpy(dtype=float)
-
-            plt.plot(
-                x,
-                y,
-                marker="o",
-                linewidth=2,
-                label=label,
-            )
-
-        if para_type == "volatility":
-            xlabel = "Label Train Threshold Multiplier λ"
-        elif para_type == "horizon":
-            xlabel = "Label Train bar horizon h"
-        else:
-            xlabel = "Train label parameter"
-
-        train_size = int(df_plot["train_size"].iloc[0])
-        test_size = int(df_plot["test_size"].iloc[0])
-
-        info = (
-            f"{total_runs} independent runs\n"
-            f"train samples = {train_size}\n"
-            f"test samples = {test_size}"
-        )
-
-        plt.title(
-            f"Cross Train Summary: Accuracy / Macro-F1 / MCC\n"
-            f"Model={model}, Eval={eval_mode}"
-        )
-        plt.xlabel(xlabel)
-        plt.ylabel("Metric value")
-        plt.grid(True, alpha=0.3)
-
-        handles, _ = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"cross_train_three_metrics_{eval_mode}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-        out_paths.append(out_path)
-
-    return out_paths
-
-def plot_cross_eval_three_metrics(
-    cross_eval_batch_summary_df: pd.DataFrame,
-    save_dir: str,
-    total_runs: int,
-    para_type: str = "volatility",
-) -> list[str]:
-    """
-    Cross-eval three-metric plot:
-    accuracy / macro_f1 / mcc in one figure.
-
-    One figure for each model + eval_mode.
-    eval_mode naturally distinguishes raw / balanced.
-    """
-
-    metrics = [
-        ("accuracy", "Accuracy"),
-        ("macro_f1", "Macro-F1"),
-        ("mcc", "MCC"),
-    ]
-
-    out_paths = []
-
-    for (model, eval_mode), df_one in cross_eval_batch_summary_df.groupby(
-        ["model", "eval_mode"],
-        dropna=False,
-    ):
-        model_save_dir = os.path.join(save_dir, str(model))
-        os.makedirs(model_save_dir, exist_ok=True)
-
-        df_plot = df_one.sort_values("eval_threshold").copy()
-
-        if len(df_plot) == 0:
-            continue
-
-        x = df_plot["eval_threshold"].to_numpy(dtype=float)
-
-        plt.figure(figsize=(10, 6))
-
-        for metric, label in metrics:
-            mean_col = f"{metric}_mean_mean"
-
-            if mean_col not in df_plot.columns:
-                continue
-
-            y = df_plot[mean_col].to_numpy(dtype=float)
-
-            plt.plot(
-                x,
-                y,
-                marker="o",
-                linewidth=2,
-                label=label,
-            )
-
-        if para_type == "volatility":
-            xlabel = "Label Eval Threshold Multiplier λ"
-        elif para_type == "horizon":
-            xlabel = "Label Eval bar horizon h"
-        else:
-            xlabel = "Eval label parameter"
-
-        train_size = int(df_plot["train_size"].iloc[0])
-        test_size = int(df_plot["test_size"].iloc[0])
-
-        info = (
-            f"{total_runs} independent runs\n"
-            f"train samples = {train_size}\n"
-            f"test samples = {test_size}"
-        )
-
-        plt.title(
-            f"Cross Eval Summary: Accuracy / Macro-F1 / MCC\n"
-            f"Model={model}, Eval={eval_mode}"
-        )
-        plt.xlabel(xlabel)
-        plt.ylabel("Metric value")
-        plt.grid(True, alpha=0.3)
-
-        handles, _ = plt.gca().get_legend_handles_labels()
-        handles.append(Line2D([], [], linestyle="none", label=info))
-        plt.legend(handles=handles, loc="best", framealpha=0.9)
-
-        plt.tight_layout()
-
-        out_path = os.path.join(
-            model_save_dir,
-            f"cross_eval_three_metrics_{eval_mode}.png",
-        )
-
-        plt.savefig(out_path, dpi=250)
-        plt.close()
-
-        out_paths.append(out_path)
-
-    return out_paths
-
-def summarize_cross_row_mean(
-    cross_eval_df: pd.DataFrame,
-    metric: str = "macro_f1",
-) -> pd.DataFrame:
-    row_by_run = (
-        cross_eval_df
-        .groupby(["model", "eval_mode", "run_id", "train_threshold"])[metric]
-        .mean()
-        .reset_index(name=f"row_mean_{metric}")
-    )
-
-    row_summary = (
-        row_by_run
-        .groupby(["model", "eval_mode", "train_threshold"])
-        .agg(
-            row_mean=(f"row_mean_{metric}", "mean"),
-            row_std=(f"row_mean_{metric}", "std"),
-            n_runs=("run_id", "nunique"),
-        )
-        .reset_index()
-        .sort_values(["model", "eval_mode", "train_threshold"])
-    )
-    return row_summary
 
 def prepare_parameter_regime_datasets(
     logger: logging.Logger, seed, labels_matrix,
@@ -2002,6 +827,152 @@ def prepare_parameter_regime_datasets(
         }
     return experiment_datsets
 
+
+# -----------------------------
+# GPU memory probing helpers
+# -----------------------------
+
+def _get_own_gpu_process_memory_usage(device_index: int = 0) -> list[float]:
+    """
+    Query the GPU's compute-process list and return each process's memory
+    usage in MiB.
+
+    Returns an empty list when:
+      - pynvml is not installed
+      - NVML query fails for any reason (no permission, driver issue, etc.)
+      - there are currently no compute processes on this GPU
+
+    Callers should treat an empty list as "no evidence of other usage",
+    which under this experiment's fixed-shape assumption means it's safe
+    to proceed with GPU training.
+    """
+    if not _PYNVML_AVAILABLE:
+        return []
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        usage_mib = [
+            p.usedGpuMemory / (1024 ** 2)
+            for p in procs
+            if p.usedGpuMemory is not None
+        ]
+        return usage_mib
+    except Exception:
+        return []
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+def _get_free_gpu_memory_mib(device_index: int = 0):
+    if not _PYNVML_AVAILABLE:
+        return None
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return info.free / (1024 ** 2)
+    except Exception:
+        return None
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+def _select_device_for_lstm(
+    logger: logging.Logger,
+    safety_margin_mib: float = 300.0,
+    device_index: int = 0,
+    max_gpu_processes: int = 10,
+) -> torch.device:
+    """
+    Decide whether this run's upcoming LSTM stage (which will sequentially
+    train every label_col with an identical shape/config) should run on GPU
+    or fall back to CPU.
+ 
+    Two independent gates, both must pass for GPU to be used:
+ 
+    1) Concurrency cap (`max_gpu_processes`):
+       Even when there is plenty of free memory, too many processes training
+       on the GPU at the same time slows every one of them down (kernel
+       launch contention, SM oversubscription, etc.). If the GPU already has
+       `max_gpu_processes` or more compute processes running, this run falls
+       back to CPU regardless of how much free memory remains.
+ 
+    2) Memory estimation:
+       Every LSTM training run in this experiment has an identical shape
+       (train_target_n, batch_size, hidden_size, ... are all fixed), so any
+       currently-running process's GPU memory usage is a good proxy for what
+       THIS run will need: required memory ~= max(usage across all current
+       GPU processes) + margin.
+ 
+    If no processes are currently using the GPU (query returns empty, either
+    because the GPU is idle or because the query itself is unavailable/
+    failed), there is nothing to conflict with on either gate, so GPU is
+    used directly.
+    """
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+ 
+    try:
+        free_mib = _get_free_gpu_memory_mib(device_index)
+
+        if free_mib is None:
+            logger.warning(
+                "Failed to query GPU free memory, falling back to CPU"
+            )
+            return torch.device("cpu")
+    except Exception:
+        logger.exception("Failed to query GPU free memory, falling back to CPU")
+        return torch.device("cpu")
+ 
+    proc_usages = _get_own_gpu_process_memory_usage(device_index)
+ 
+    if not proc_usages:
+        # No processes detected (idle GPU, or query unavailable/failed):
+        # nothing to compete with on either gate, so allow GPU directly.
+        logger.info(
+            f"No GPU process usage detected (free={free_mib:.0f}MiB), "
+            f"proceeding with GPU for this LSTM stage"
+        )
+        return torch.device(f"cuda:{device_index}")
+ 
+    # ---- Gate 1: concurrency cap ----
+    current_process_count = len(proc_usages)
+    # if current_process_count >= max_gpu_processes:
+    #     logger.warning(
+    #         f"GPU already has {current_process_count} compute processes "
+    #         f"(>= max_gpu_processes={max_gpu_processes}), this LSTM stage "
+    #         f"will run on CPU instead to avoid overcrowding the GPU"
+    #     )
+    #     return torch.device("cpu")
+    # else:
+    #     logger.info(
+    #         f"GPU already has {current_process_count} compute processes "
+    #     )
+ 
+    # ---- Gate 2: memory estimation ----
+    estimated_required_mib = max(proc_usages) + safety_margin_mib
+    logger.info(
+        f"GPU processes currently: {current_process_count} "
+        f"(max_gpu_processes={max_gpu_processes}), "
+        f"max usage={max(proc_usages):.0f}MiB, free={free_mib:.0f}MiB, "
+        f"estimated required for this run={estimated_required_mib:.0f}MiB"
+    )
+ 
+    if free_mib < estimated_required_mib:
+        logger.warning(
+            f"GPU free memory low ({free_mib:.0f}MiB < estimated required "
+            f"{estimated_required_mib:.0f}MiB), this LSTM stage will run on CPU instead"
+        )
+        return torch.device("cpu")
+ 
+    return torch.device(f"cuda:{device_index}")
+
+
 def train_lstm_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -2018,9 +989,11 @@ def train_lstm_model(
     patience: int = 5,
     min_delta: float = 1e-4,
     logger: logging.Logger = None,
+    device: torch.device = None,
 ):
     set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.long)
@@ -2176,13 +1149,30 @@ def run_single_iteration(
     )
     random_baseline_done = set()
 
-    for experiment_model in ['DecisionTree', 'LogisticRegression', 'LSTM']:
+    # 用独立的随机序列打乱模型训练顺序，避免所有进程的 LSTM 训练同时撞在一起。
+    # 用与 t_seed 不同的偏移量，保证这里的随机性和数据采样的随机性互不干扰。
+    model_order = ['DecisionTree', 'LogisticRegression', 'LSTM']
+    order_rng = np.random.default_rng(t_seed + 777777)
+    order_rng.shuffle(model_order)
+    logger.info(f"run_id={run_id} model training order: {model_order}")
+
+    for experiment_model in model_order:
         if 'd' in pre_para.interval and experiment_model == 'LSTM':
             logger.info(
                 f"skip LSTM on {pre_para.symbol}_{pre_para.interval}, "
                 f"since the dataset is insufficient to complete the training."
             )
             continue
+
+        # 在整个 LSTM 阶段（会连续训练本 run_id 下所有 label_cols）开始前，
+        # 只查询一次 GPU 显存占用情况，据此决定这一整段是走 GPU 还是回退 CPU。
+        # 由于本实验每次 LSTM 训练的 shape 完全固定，当前 GPU 上任意一个进程
+        # 的显存占用都可以作为本次训练所需显存的预估；若没有查到任何进程占用
+        # （GPU 空闲，或查询本身不可用/失败），则直接允许使用 GPU。
+        lstm_device = None
+        if experiment_model == 'LSTM':
+            lstm_device = _select_device_for_lstm(logger)
+            logger.info(f"run_id={run_id} LSTM stage will use device={lstm_device}")
 
         for col_idx, col_name in enumerate(label_cols):
             logger.info(f"{experiment_model} train {col_name}")
@@ -2242,24 +1232,11 @@ def run_single_iteration(
                     dropout=0.2,
                     patience=5,
                     logger=logger,
+                    device=lstm_device,
                 )
 
-            # Within-Regime Evaluation
-            y_te_bal = y_all[test_index]
-            if experiment_model == 'LSTM':
-                X_te_bal = X_full[test_index]
-                y_pred_bal = predict_lstm_model(model, X_te_bal)
-            else:
-                X_te_bal = X_full_flat[test_index]
-                y_pred_bal = model.predict(X_te_bal)
-
-            f1_bal = float(f1_score(y_te_bal, y_pred_bal, average="macro"))
-            mcc_bal = float(matthews_corrcoef(y_te_bal, y_pred_bal))
-            acc = float(accuracy_score(y_te_bal, y_pred_bal))
+            # Within-Regime Evaluation (balanced test set + original/raw test set)
             class_labels = [common.Signal.POSITIVE, common.Signal.NEGATIVE, common.Signal.NEUTRAL]
-            p_class, r_class, f_class, _ = precision_recall_fscore_support(
-                y_te_bal, y_pred_bal, labels=class_labels, zero_division=0
-            )
 
             n_pos = int(np.sum(y_all[test_idx] == common.Signal.POSITIVE))
             n_neg = int(np.sum(y_all[test_idx] == common.Signal.NEGATIVE))
@@ -2271,28 +1248,145 @@ def run_single_iteration(
                 f"balanced_class_size={balanced_class_size}"
             )
 
-            self_eval_rows_local.append(
-                {
-                    "run_id": run_id,
-                    "model": experiment_model,
-                    "eval_mode": 'balanced',
-                    "label_name": col_name,
-                    "threshold": threshold,
-                    "macro_f1": f1_bal,
-                    "mcc": mcc_bal,
-                    "accuracy": acc,
-                    "p_pos": p_class[0], "r_pos": r_class[0], "f_pos": f_class[0],
-                    "p_neg": p_class[1], "r_neg": r_class[1], "f_neg": f_class[1],
-                    "p_neu": p_class[2], "r_neu": r_class[2], "f_neu": f_class[2],
-                    "n_eff": n_eff,
-                    "train_size": int(3 * n_eff),
-                    "test_size": int(len(y_te_bal)),
-                    "test_pos_raw": n_pos,
-                    "test_neg_raw": n_neg,
-                    "test_neu_raw": n_neu,
-                    "balanced_class_size": balanced_class_size,
-                }
-            )
+            # ---------------------------------------------------------------
+            # RandomPredict baseline: computed once per label (col_name),
+            # regardless of experiment_model, since a random predictor does
+            # not depend on any trained model. Both balanced and raw variants
+            # sample according to the TRUE class proportions of their own
+            # eval set (p=None would be uniform): for the balanced test set
+            # this is ~1/3 each by construction, for the raw test set this
+            # reflects the real class imbalance, so a real model's macro_f1
+            # actually has to beat "just guessing the base rate" to look
+            # good, not merely beat a naive uniform guess. The SAME raw-test
+            # random predictions are reused for both the self-eval baseline
+            # below and the financial-return baseline further down, so the
+            # two baselines are consistent with each other.
+            # ---------------------------------------------------------------
+            if col_name not in random_baseline_done:
+                p_bal = compute_class_proportions(y_all[test_index])
+                p_raw = compute_class_proportions(y_all[test_idx])
+
+                y_random_pred_bal = generate_random_predictions(
+                    n=len(test_index), seed=t_seed + 900000 + col_idx, p=p_bal,
+                )
+                y_random_pred_raw = generate_random_predictions(
+                    n=len(test_idx), seed=t_seed + 900000 + col_idx + 500000, p=p_raw,
+                )
+
+                for rb_eval_mode, rb_eval_idx, rb_y_pred in [
+                    ('balanced', test_index, y_random_pred_bal),
+                    ('raw', test_idx, y_random_pred_raw),
+                ]:
+                    y_te_rb = y_all[rb_eval_idx]
+                    f1_rb = float(f1_score(y_te_rb, rb_y_pred, average="macro"))
+                    mcc_rb = float(matthews_corrcoef(y_te_rb, rb_y_pred))
+                    acc_rb = float(accuracy_score(y_te_rb, rb_y_pred))
+                    p_rb, r_rb, f_rb, _ = precision_recall_fscore_support(
+                        y_te_rb, rb_y_pred, labels=class_labels, zero_division=0
+                    )
+
+                    self_eval_rows_local.append(
+                        {
+                            "run_id": run_id,
+                            "model": "RandomPredict",
+                            "eval_mode": rb_eval_mode,
+                            "label_name": col_name,
+                            "threshold": threshold,
+                            "macro_f1": f1_rb,
+                            "mcc": mcc_rb,
+                            "accuracy": acc_rb,
+                            "p_pos": p_rb[0], "r_pos": r_rb[0], "f_pos": f_rb[0],
+                            "p_neg": p_rb[1], "r_neg": r_rb[1], "f_neg": f_rb[1],
+                            "p_neu": p_rb[2], "r_neu": r_rb[2], "f_neu": f_rb[2],
+                            "n_eff": n_eff,
+                            "train_size": 0,
+                            "test_size": int(len(y_te_rb)),
+                            "test_pos_raw": n_pos,
+                            "test_neg_raw": n_neg,
+                            "test_neu_raw": n_neu,
+                            "balanced_class_size": balanced_class_size,
+                        }
+                    )
+
+                logger.info(
+                    f"{col_name} | RandomPredict self-eval baseline computed (balanced + raw); "
+                    f"p_bal(pos,neg,neu)={np.round(p_bal, 3).tolist()}, "
+                    f"p_raw(pos,neg,neu)={np.round(p_raw, 3).tolist()}"
+                )
+
+                # Reuse the raw-test random predictions computed above for the financial baseline.
+                begin_time = time.time()
+                random_financial_metrics = compute_financial_returns(
+                    df=df, pre_para=pre_para, para_horizon=para_horizon,
+                    window_indices=window_indices, sample_idx=test_idx,
+                    y_pred=y_random_pred_raw, label_col=col_name,
+                    initial_cash=10000.0, fee_rates=[0.0, 0.0005], price_col="close",
+                )
+                end_time = time.time()
+                logger.info(
+                    f"compute RandomPredict financial_returns for {col_name} "
+                    f"takes time: {(end_time - begin_time):.2f} seconds"
+                )
+                for fm in random_financial_metrics:
+                    financial_metrics_local.append(
+                        {
+                            "run_id": run_id, "model": "RandomPredict", "eval_mode": "raw_test",
+                            "label_name": col_name, "threshold": threshold,
+                            "test_size": int(len(test_idx)), **fm,
+                        }
+                    )
+                random_baseline_done.add(col_name)
+
+            y_pred_raw = None  # captured below when self_eval_mode == 'raw'; reused later for financial backtest
+
+            for self_eval_mode in ['balanced', 'raw']:
+                eval_idx = test_index if self_eval_mode == 'balanced' else test_idx
+
+                y_te = y_all[eval_idx]
+                if experiment_model == 'LSTM':
+                    X_te = X_full[eval_idx]
+                    y_pred = predict_lstm_model(model, X_te)
+                else:
+                    X_te = X_full_flat[eval_idx]
+                    y_pred = model.predict(X_te)
+
+                if self_eval_mode == 'raw':
+                    y_pred_raw = y_pred  # reused later for financial backtest, avoids recomputation
+
+                f1_ = float(f1_score(y_te, y_pred, average="macro"))
+                mcc_ = float(matthews_corrcoef(y_te, y_pred))
+                acc_ = float(accuracy_score(y_te, y_pred))
+                p_class, r_class, f_class, _ = precision_recall_fscore_support(
+                    y_te, y_pred, labels=class_labels, zero_division=0
+                )
+
+                logger.info(
+                    f"{col_name} | {experiment_model} self-eval [{self_eval_mode}]: "
+                    f"macro_f1={f1_:.4f}, mcc={mcc_:.4f}, acc={acc_:.4f}"
+                )
+
+                self_eval_rows_local.append(
+                    {
+                        "run_id": run_id,
+                        "model": experiment_model,
+                        "eval_mode": self_eval_mode,
+                        "label_name": col_name,
+                        "threshold": threshold,
+                        "macro_f1": f1_,
+                        "mcc": mcc_,
+                        "accuracy": acc_,
+                        "p_pos": p_class[0], "r_pos": r_class[0], "f_pos": f_class[0],
+                        "p_neg": p_class[1], "r_neg": r_class[1], "f_neg": f_class[1],
+                        "p_neu": p_class[2], "r_neu": r_class[2], "f_neu": f_class[2],
+                        "n_eff": n_eff,
+                        "train_size": int(3 * n_eff),
+                        "test_size": int(len(y_te)),
+                        "test_pos_raw": n_pos,
+                        "test_neg_raw": n_neg,
+                        "test_neu_raw": n_neu,
+                        "balanced_class_size": balanced_class_size,
+                    }
+                )
 
             # Cross-Regime Evaluation
             for eval_mode in ['balanced', 'raw']:
@@ -2319,6 +1413,9 @@ def run_single_iteration(
                     f1_cross = float(f1_score(y_te_cross, y_pred_cross, average="macro"))
                     mcc_cross = float(matthews_corrcoef(y_te_cross, y_pred_cross))
                     acc_cross = float(accuracy_score(y_te_cross, y_pred_cross))
+                    p_class_cross, r_class_cross, f_class_cross, _ = precision_recall_fscore_support(
+                        y_te_cross, y_pred_cross, labels=class_labels, zero_division=0
+                    )
 
                     cross_eval_rows_local.append(
                         {
@@ -2333,44 +1430,15 @@ def run_single_iteration(
                             "macro_f1": f1_cross,
                             "mcc": mcc_cross,
                             "accuracy": acc_cross,
+                            "p_pos": p_class_cross[0], "r_pos": r_class_cross[0], "f_pos": f_class_cross[0],
+                            "p_neg": p_class_cross[1], "r_neg": r_class_cross[1], "f_neg": f_class_cross[1],
+                            "p_neu": p_class_cross[2], "r_neu": r_class_cross[2], "f_neu": f_class_cross[2],
                             "test_size": int(len(y_te_cross)),
                         }
                     )
 
-            # Financial return backtest
-            if col_name not in random_baseline_done:
-                y_random_pred = generate_random_predictions(
-                    n=len(test_idx),
-                    seed=t_seed + 900000 + col_idx,
-                )
-                begin_time = time.time()
-                random_financial_metrics = compute_financial_returns(
-                    df=df, pre_para=pre_para, para_horizon=para_horizon,
-                    window_indices=window_indices, sample_idx=test_idx,
-                    y_pred=y_random_pred, label_col=col_name,
-                    initial_cash=10000.0, fee_rates=[0.0, 0.0005], price_col="close",
-                )
-                end_time = time.time()
-                logger.info(
-                    f"compute RandomPredict financial_returns for {col_name} "
-                    f"takes time: {(end_time - begin_time):.2f} seconds"
-                )
-                for fm in random_financial_metrics:
-                    financial_metrics_local.append(
-                        {
-                            "run_id": run_id, "model": "RandomPredict", "eval_mode": "raw_test",
-                            "label_name": col_name, "threshold": threshold,
-                            "test_size": int(len(test_idx)), **fm,
-                        }
-                    )
-                random_baseline_done.add(col_name)
-
-            if experiment_model == 'LSTM':
-                X_test = X_full[test_idx]
-                y_test_pred = predict_lstm_model(model, X_test)
-            else:
-                X_test = X_full_flat[test_idx]
-                y_test_pred = model.predict(X_test)
+            # Financial return backtest (RandomPredict baseline already handled once per label above)
+            y_test_pred = y_pred_raw
 
             begin_time = time.time()
             financial_metrics = compute_financial_returns(
@@ -2389,6 +1457,9 @@ def run_single_iteration(
                         "test_size": int(len(test_idx)), **fm,
                     }
                 )
+        if experiment_model == 'LSTM':
+            del model
+            torch.cuda.empty_cache()
 
     logger.info(f"Finished run {run_id+1}/{total_runs}")
     return self_eval_rows_local, cross_eval_rows_local, financial_metrics_local
@@ -2447,7 +1518,7 @@ def run_fixed_neutral_subsampling_experiment(
 
     logger.info(f"Master windows M={M} | train={len(train_idx)} | val={len(val_idx)} | test={len(test_idx)}")
 
-    total_runs = 20
+    total_runs = 50
 
     strictest_train_target_n = np.inf
     strictest_val_target_n = np.inf
@@ -2532,13 +1603,19 @@ def run_fixed_neutral_subsampling_experiment(
     cross_eval_df = pd.DataFrame(cross_eval_rows)
     financial_return_df = pd.DataFrame(financial_metrics_list)
 
-    self_summary_df = (self_eval_df.groupby(["model", "threshold"]).agg(
+    self_summary_df = (self_eval_df.groupby(["model", "eval_mode", "threshold"]).agg(
             macro_f1_mean=("macro_f1", "mean"),
             macro_f1_std=("macro_f1", "std"),
             mcc_mean=("mcc", "mean"),
             mcc_std=("mcc", "std"),
             accuracy_mean=("accuracy", "mean"),
             accuracy_std=("accuracy", "std"),
+            p_pos_mean=("p_pos", "mean"), p_pos_std=("p_pos", "std"),
+            r_pos_mean=("r_pos", "mean"), r_pos_std=("r_pos", "std"),
+            f_pos_mean=("f_pos", "mean"), f_pos_std=("f_pos", "std"),
+            p_neg_mean=("p_neg", "mean"), p_neg_std=("p_neg", "std"),
+            r_neg_mean=("r_neg", "mean"), r_neg_std=("r_neg", "std"),
+            f_neg_mean=("f_neg", "mean"), f_neg_std=("f_neg", "std"),
             n_runs=("run_id", "nunique"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
@@ -2550,6 +1627,12 @@ def run_fixed_neutral_subsampling_experiment(
             macro_f1_mean=("macro_f1", "mean"),
             mcc_mean=("mcc", "mean"),
             accuracy_mean=("accuracy", "mean"),
+            p_pos_mean=("p_pos", "mean"),
+            r_pos_mean=("r_pos", "mean"),
+            f_pos_mean=("f_pos", "mean"),
+            p_neg_mean=("p_neg", "mean"),
+            r_neg_mean=("r_neg", "mean"),
+            f_neg_mean=("f_neg", "mean"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -2562,6 +1645,12 @@ def run_fixed_neutral_subsampling_experiment(
             mcc_mean_std=("mcc_mean", "std"),
             accuracy_mean_mean=("accuracy_mean", "mean"),
             accuracy_mean_std=("accuracy_mean", "std"),
+            p_pos_mean_mean=("p_pos_mean", "mean"), p_pos_mean_std=("p_pos_mean", "std"),
+            r_pos_mean_mean=("r_pos_mean", "mean"), r_pos_mean_std=("r_pos_mean", "std"),
+            f_pos_mean_mean=("f_pos_mean", "mean"), f_pos_mean_std=("f_pos_mean", "std"),
+            p_neg_mean_mean=("p_neg_mean", "mean"), p_neg_mean_std=("p_neg_mean", "std"),
+            r_neg_mean_mean=("r_neg_mean", "mean"), r_neg_mean_std=("r_neg_mean", "std"),
+            f_neg_mean_mean=("f_neg_mean", "mean"), f_neg_mean_std=("f_neg_mean", "std"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -2571,6 +1660,12 @@ def run_fixed_neutral_subsampling_experiment(
             macro_f1_mean=("macro_f1", "mean"),
             mcc_mean=("mcc", "mean"),
             accuracy_mean=("accuracy", "mean"),
+            p_pos_mean=("p_pos", "mean"),
+            r_pos_mean=("r_pos", "mean"),
+            f_pos_mean=("f_pos", "mean"),
+            p_neg_mean=("p_neg", "mean"),
+            r_neg_mean=("r_neg", "mean"),
+            f_neg_mean=("f_neg", "mean"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -2583,6 +1678,12 @@ def run_fixed_neutral_subsampling_experiment(
             mcc_mean_std=("mcc_mean", "std"),
             accuracy_mean_mean=("accuracy_mean", "mean"),
             accuracy_mean_std=("accuracy_mean", "std"),
+            p_pos_mean_mean=("p_pos_mean", "mean"), p_pos_mean_std=("p_pos_mean", "std"),
+            r_pos_mean_mean=("r_pos_mean", "mean"), r_pos_mean_std=("r_pos_mean", "std"),
+            f_pos_mean_mean=("f_pos_mean", "mean"), f_pos_mean_std=("f_pos_mean", "std"),
+            p_neg_mean_mean=("p_neg_mean", "mean"), p_neg_mean_std=("p_neg_mean", "std"),
+            r_neg_mean_mean=("r_neg_mean", "mean"), r_neg_mean_std=("r_neg_mean", "std"),
+            f_neg_mean_mean=("f_neg_mean", "mean"), f_neg_mean_std=("f_neg_mean", "std"),
             train_size=("train_size", "first"),
             test_size=("test_size", "first"),
         )
@@ -2656,6 +1757,10 @@ def run_fixed_neutral_subsampling_experiment(
             .sort_values(["model", "fee_rate", "threshold"])
         )
 
+    # ---- Persist every summary table needed to (re)draw all figures later ----
+    # This is the sole hand-off point to plot_results.py: as long as these
+    # files exist under save_dir, plots can be regenerated at any time
+    # without re-running any training/evaluation.
     self_eval_df.to_csv(os.path.join(save_dir, "self_eval_all_runs.csv"), index=False)
     cross_eval_df.to_csv(os.path.join(save_dir, "cross_eval_all_runs.csv"), index=False)
     self_summary_df.to_csv(os.path.join(save_dir, "self_eval_summary_mean_std.csv"), index=False)
@@ -2663,6 +1768,7 @@ def run_fixed_neutral_subsampling_experiment(
     cross_train_batch_summary_df.to_csv(os.path.join(save_dir, "cross_train_batch_summary_mean_std.csv"), index=False)
     cross_eval_summary_df.to_csv(os.path.join(save_dir, "cross_eval_summary_std.csv"), index=False)
     cross_eval_batch_summary_df.to_csv(os.path.join(save_dir, "cross_eval_batch_summary_mean_std.csv"), index=False)
+    cross_matrix_summary_df.to_csv(os.path.join(save_dir, "cross_matrix_summary_mean_std.csv"), index=False)
 
     financial_return_df.to_csv(
         os.path.join(save_dir, "financial_return_all_runs.csv"),
@@ -2674,37 +1780,49 @@ def run_fixed_neutral_subsampling_experiment(
         index=False,
     )
 
-    plot_self_eval_mean_std(self_summary_df, save_dir, metric="macro_f1", para_type = pre_para.para_type)
-    plot_self_eval_mean_std(self_summary_df, save_dir, metric="accuracy",para_type = pre_para.para_type)
-    plot_self_eval_mean_std(self_summary_df, save_dir, metric="mcc",para_type = pre_para.para_type)
-    # plot_self_eval_three_metrics(self_summary_df, save_dir, para_type=pre_para.para_type,)
+    meta = {
+        "symbol": pre_para.symbol,
+        "interval": pre_para.interval,
+        "label_type": pre_para.label_type,
+        "para_type": pre_para.para_type,
+        "total_runs": total_runs,
+    }
+    with open(os.path.join(save_dir, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
 
-    plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="accuracy", total_runs=total_runs,para_type = pre_para.para_type)
-    # plot_cross_train_three_metrics(cross_train_batch_summary_df,save_dir,total_runs=total_runs,para_type=pre_para.para_type,)
+    # ---- Copy preparation.py's provenance files as-is into save_dir ----
+    for fname in ("data_config_meta.json", "label_sweep_meta.json"):
+        src = os.path.join(prep_output_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(save_dir, fname))
+            logger.info(f"copied {src} -> {save_dir}")
+        else:
+            logger.warning(f"{src} not found, skipping copy")
 
-    plot_cross_eval_batch_summary(cross_eval_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_cross_eval_batch_summary(cross_eval_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_cross_eval_batch_summary(cross_eval_batch_summary_df, save_dir, metric="accuracy", total_runs=total_runs,para_type = pre_para.para_type)
-    # plot_cross_eval_three_metrics(cross_eval_batch_summary_df, save_dir, total_runs=total_runs, para_type=pre_para.para_type,)
+        # ---- Plotting is fully decoupled: hand the in-memory summary tables to
 
-    plot_train_vs_eval_summary(cross_train_batch_summary_df, cross_eval_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_train_vs_eval_summary(cross_train_batch_summary_df, cross_eval_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_train_vs_eval_summary(cross_train_batch_summary_df, cross_eval_batch_summary_df, save_dir, metric="accuracy", total_runs=total_runs,para_type = pre_para.para_type)
-    plot_cross_eval_heatmap(cross_matrix_summary_df, save_dir, metric="macro_f1",annotate_std=True,para_type = pre_para.para_type)
-    plot_cross_eval_heatmap(cross_matrix_summary_df, save_dir, metric="mcc",annotate_std=True,para_type = pre_para.para_type)
-    plot_cross_eval_heatmap(cross_matrix_summary_df, save_dir, metric="accuracy",annotate_std=True,para_type = pre_para.para_type)
-
-    plot_financial_return_mean_std(financial_summary_df, save_dir, metric="strategy_total_return", para_type = pre_para.para_type, )
-    plot_financial_return_mean_std(financial_summary_df, save_dir, metric="signal_avg_return", para_type = pre_para.para_type,)
-    # plot_financial_three_means(financial_summary_df, save_dir, para_type=pre_para.para_type, random_metric="strategy_total_return_mean",)
+    # ---- Plotting is fully decoupled: hand the in-memory summary tables to
+    # plot_results.py so figures are produced right away. The exact same
+    # CSVs are on disk under save_dir, so `python plot_results.py --save_dir
+    # <save_dir>` can regenerate every figure later without re-training. ----
+    logger.info(f"Training/evaluation done, generating plots via plot_results.py into {save_dir}")
+    plot_results.generate_all_plots(
+        save_dir=save_dir,
+        para_type=pre_para.para_type,
+        total_runs=total_runs,
+        self_summary_df=self_summary_df,
+        cross_train_batch_summary_df=cross_train_batch_summary_df,
+        cross_eval_batch_summary_df=cross_eval_batch_summary_df,
+        cross_matrix_summary_df=cross_matrix_summary_df,
+        financial_summary_df=financial_summary_df,
+    )
+    compose_report_images.run_compose_report(pre_para)
 # -----------------------------
 # Entrypoint
 # -----------------------------
 def main(
     logger: logging.Logger,
-    train_cfg: TrainConfig = TrainConfig(),
+    train_cfg: TrainConfig ,
     pre_para: common.BaseDefine = common.BaseDefine(),
     prep_output_dir: str = common.DATA_OUT_DIR,
     save_dir: str = common.TRAIN_OUT_DIR,
@@ -2718,7 +1836,7 @@ def main(
         pre_para=pre_para,
         prep_output_dir=prep_output_dir,
         save_dir=save_dir,
-        max_workers = 8
+        max_workers = 25
     )
 
 if __name__ == "__main__":

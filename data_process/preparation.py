@@ -1,5 +1,3 @@
-from pickle import FALSE
-from tkinter import TRUE
 import pandas as pd
 import numpy as np
 import datetime, os, sys, re, math, json, logging, argparse
@@ -16,9 +14,9 @@ def plot_label_distribution(df, interval_ms, para, label_function):
     stop_range = [np.inf]
 
     if para.para_type == 'volatility':
-        parameter_range = np.arange(0.1, 10, 0.1).round(2)
+        parameter_range = np.arange(0.1, 10+0.1, 0.1).round(2)
     elif para.para_type == 'horizon':
-        parameter_range = np.arange(1, 80, 1).astype(int)
+        parameter_range = np.arange(1, 80+1, 1).astype(int)
     else:
         raise ValueError(f"Unsupported para_type: {para.para_type}")
 
@@ -94,19 +92,11 @@ def summary_statistics_stock(para, prep_output_dir, df, label_col, logger):
 
     logger.info(f"✅ 数据准备完成。配置文件已写入: {meta_path}")
 
-def summary_statistics(para,prep_output_dir,df, logger):
-    label_cols = [
-        col for col in df.columns 
-        if col.startswith('label_') and not any(sub in col for sub in ['index', 'id', 'exit', 'price', 'threshold', 'strength', 'stop'])
-    ]
+def summary_statistics(para, prep_output_dir, df, logger, label_col='label'):
+    # Use the consensus label produced by generate_strict_consensus_label
+    # (all swept label_vXX/label_hXX columns unanimous), not any single
+    # individual column -- that's the actual "strictest" label.    logger.info(f"strictest label column is '{label_col}' (consensus label from generate_strict_consensus_label)")
     
-    if label_cols:
-        # 此时剩下的全部是真正的标签列（如 label_3.5_3.5），再从中安全地寻找 0 最少的列
-        label_col = min(label_cols, key=lambda c: int((df[c] == 0).sum()))
-        logger.info(f"strictest label column is {label_col}")
-    else:
-        label_col = 'label'
-
     # ---------------- Summary statistics ----------------
     if 'open_time_date_utc' not in df.columns:
         df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
@@ -180,9 +170,13 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
     elif para.para_type == 'horizon':
         vol_multiplier = kwargs['vol_multiplier']
         para.vol_multiplier_long = vol_multiplier
-        para.stop_multiplier_rate_long = None
         para.vol_multiplier_short = vol_multiplier
-        para.stop_multiplier_rate_short = None
+        if para.label_type == 'FTHL':
+            para.stop_multiplier_rate_short = None
+            para.stop_multiplier_rate_long = None
+        else:
+            para.stop_multiplier_rate_short = 1
+            para.stop_multiplier_rate_long = 1
     if args.mode == 'plot':
         plot_label_distribution(df, interval_ms, para, common.attach_label)        # 4. Run analysis
 
@@ -196,9 +190,25 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
             - Otherwise (mixed directions or trend-to-range transitions) -> Signal.INVALID (-1)
             """
             label_col = 'label'
-            label_cols = [c for c in df.columns if c.startswith(label_prefix)]
+            label_pattern = re.compile(rf"^{label_prefix}(\d+)$")
+
+            label_cols = sorted(
+                [c for c in df.columns if label_pattern.fullmatch(c)],
+                key=lambda x: int(label_pattern.fullmatch(x).group(1)),
+            )
             if not label_cols:
                 return df
+
+            # 找出 pos/neg/neu 里最少的那个类别数最小的列，即真正意义上"最严格"的标签列
+            def _min_class_count(c):
+                counts = df[c].value_counts()
+                return min(
+                    int(counts.get(common.Signal.POSITIVE, 0)),
+                    int(counts.get(common.Signal.NEGATIVE, 0)),
+                    int(counts.get(common.Signal.NEUTRAL, 0)),
+                )
+            strictest_col = min(label_cols, key=_min_class_count)
+            logger.info(f"strictest label column is {strictest_col} (min class count = {_min_class_count(strictest_col)})")
 
             # Check whether all label columns agree on each row.
             # .nunique(axis=1) == 1 means all label_vXX columns point to the same outcome.
@@ -214,9 +224,13 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
             volatility_range = kwargs['volatility_range']
             for t_range in volatility_range:
                 para.vol_multiplier_long = t_range
-                para.stop_multiplier_rate_long = None
                 para.vol_multiplier_short = t_range
-                para.stop_multiplier_rate_short = None
+                if para.label_type == 'FTHL':
+                    para.stop_multiplier_rate_short = None
+                    para.stop_multiplier_rate_long = None
+                else:
+                    para.stop_multiplier_rate_short = 1
+                    para.stop_multiplier_rate_long = 1 
                 label_suffix = f"v{int(round(t_range * 10)):02d}"
                 para_label = f'label_{label_suffix}'
                 df = common.attach_label(df, para=para, label_col=para_label)
@@ -227,14 +241,25 @@ def main(logger:logging.Logger, args, feature_group_list = common.FEATURE_GROUP_
                 label_suffix = f"h{int(round(t_range * 10)):02d}"
                 para_label = f'label_{label_suffix}'
                 df = common.attach_label(df, para=para, label_col=para_label)
-        df = generate_strict_consensus_label(df)
+        if para.para_type == 'volatility':
+            label_prefix = "label_v"
+        elif para.para_type == 'horizon':
+            label_prefix = "label_h"
+        df = generate_strict_consensus_label(df, label_prefix = label_prefix)
         # ---------------- Summary statistics ----------------
         summary_statistics(para, prep_output_dir, df, logger)
+        write_label_sweep_meta(prep_output_dir, kwargs, logger) 
     elif args.mode == 'label':
         df = common.attach_label(df, para=para, label_col=f'label')
         summary_statistics(para, prep_output_dir, df, logger)
     else:
         logger.warning("No action specified. Use --plot to visualize label distribution or --label to generate labels and summary statistics.")
+
+def write_label_sweep_meta(prep_output_dir, kwargs, logger):
+    path = os.path.join(prep_output_dir, "label_sweep_meta.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(common.json_safe(kwargs), f, indent=4, ensure_ascii=False)
+    logger.info(f"📍 Label sweep config written to: {path}")
 
 if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
@@ -248,19 +273,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger, _ = common.setup_session_logger(sub_folder='dissertation/data_process')
     
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.1, 10, 0.1).round(1),predict_num=16) 
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier = 10)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.1, 10, 0.1).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(16, 80, 1), vol_multiplier = 10)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_volatility,volatility_range= np.arange(0.1, 10.1, 0.1).round(1),predict_num=16)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_fthl_horizon, horizon_range= np.arange(12, 81, 1), vol_multiplier = 10)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_volatility, volatility_range= np.arange(0.1, 10.1, 0.1).round(1), predict_num= 8)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.BTC_15m_tbm_horizon, horizon_range =  np.arange(8, 81, 1), vol_multiplier = 10)
 
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_volatility, volatility_range= np.arange(0.1, 10, 0.1).round(1), predict_num = 16)
-    main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=10)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_volatility, volatility_range= np.arange(0.1,10, 0.1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_horizon, horizon_range= np.arange(16, 80, 1), vol_multiplier=4)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_volatility, volatility_range= np.arange(0.1, 4, 0.1).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier=2)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_tbm_volatility, volatility_range= np.arange(0.5, 3, 0.1).round(1), predict_num= 16)
-    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_tbm_horizon, horizon_range= np.arange(2, 80, 2), vol_multiplier= 2)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_volatility, volatility_range= np.arange(0.1, 10.1, 0.1).round(1), predict_num = 8)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_fthl_horizon, horizon_range= np.arange(4, 81, 1), vol_multiplier=10)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_volatility, volatility_range= np.arange(0.1,10.1, 0.1), predict_num= 8)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_15m_tbm_horizon, horizon_range= np.arange(4, 81, 1), vol_multiplier=10)
+    
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_volatility, volatility_range= np.arange(0.1, 4.1, 0.1).round(1), predict_num= 8)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_fthl_horizon, horizon_range= np.arange(8, 41, 1), vol_multiplier=4)
+    # main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_tbm_volatility, volatility_range= np.arange(2, 4.1, 0.1).round(1), predict_num= 8)
+    main(logger, args, common.FEATURE_GROUP_LIST, para = common.XAUUSD_1d_tbm_horizon, horizon_range= np.arange(8, 41, 1), vol_multiplier= 4)
 
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_volatility, volatility_range= np.arange(0.1, 6, 0.1).round(1), predict_num = 16)
     # main(logger, args, common.FEATURE_GROUP_LIST, para = common.QQQ_15m_fthl_horizon, horizon_range= np.arange(2, 24, 2), vol_multiplier=3)

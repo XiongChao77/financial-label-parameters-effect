@@ -141,7 +141,7 @@ DEFAULT_FEATURES: List[str] = [
 class TrainConfig:
     seq_len: int = 8
     feature_conf_list: List[str] = field(default_factory=lambda: DEFAULT_FEATURES)
-    stride: int = 1
+    stride: int = 2
     seed: int = 42
     n_iterations: int = 3
 

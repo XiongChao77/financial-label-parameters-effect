@@ -7,4 +7,6 @@ This dissertation studies how parameterized labeling reshapes the supervised lea
 # Environment
 pip install -U massive 
 pip install numpy scipy pandas scikit-learn matplotlib seaborn plotly notebook jupyterlab ipykernel statsmodels xgboost lightgbm tqdm joblib requests beautifulsoup4 pytorch-ignite  colorlog backtrader pyarrow numba GitPython ignite yfinance boto3
- 
+pip install nvidia-ml-py --break-system-packages
+
+# dataset size requirement for traning
