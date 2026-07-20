@@ -78,28 +78,45 @@ class LabelRatioCurveAnalyzer:
     def run_parameter_sweep(
         self,
         parameter_range,
-        stop_range=None,
         fun=common.attach_label,
         label_col="label",
     ):
         """
-        Scan one parameter and record label ratios.
+        Scan one parameter (volatility multiplier or horizon) and record
+        label ratios.
 
         Parameters
         ----------
         parameter_range : iterable
             If para.para_type == 'volatility', values are vol_multiplier.
             If para.para_type == 'horizon', values are predict_num / horizon.
-        stop_range : iterable or None
-            Kept for compatibility with LabelRegimeAnalyzer. Default: [np.inf].
         fun : callable
             Label function, normally common.attach_label.
         label_col : str
             Temporary label column name used in each sweep iteration.
-        """
-        if stop_range is None:
-            stop_range = [np.inf]
 
+        Notes
+        -----
+        stop_multiplier_rate_long / stop_multiplier_rate_short are FIXED
+        for the entire sweep: whatever value `self.para` carries at
+        construction time is what every sweep point uses (deep-copied,
+        never overwritten here). This class does not sweep over
+        stop-loss configurations -- to compare different
+        stop_multiplier_rate settings, construct a separate
+        LabelRatioCurveAnalyzer (with its own `para`) per setting.
+
+        Same-bar double-barrier-touch samples (Signal.AMBIGUOUS) are
+        excluded from the "hard invalid" bucket and instead split 50/50
+        into the positive/negative counts for this diagnostic ratio
+        curve, since the true direction is unrecoverable from OHLC data
+        but the underlying touch event itself is real and, for a
+        symmetric/driftless barrier, equally likely to have resolved
+        either way. This is purely a plotting-time adjustment; the
+        underlying label column retains the AMBIGUOUS value untouched,
+        so downstream training code (which only selects exact
+        POSITIVE/NEGATIVE/NEUTRAL matches) still excludes these samples
+        entirely.
+        """
         parameter_values = list(parameter_range)
         sweep_data = []
 
@@ -107,57 +124,79 @@ class LabelRatioCurveAnalyzer:
         print(
             f"🚀 Scanning label ratio curves | "
             f"symbol={self.symbol}, interval={self.interval}, "
-            f"label_type={self.label_type}, para_type={self.para_type}"
+            f"label_type={self.label_type}, para_type={self.para_type}, "
+            f"stop_multiplier_rate_long={self.para.stop_multiplier_rate_long}, "
+            f"stop_multiplier_rate_short={self.para.stop_multiplier_rate_short}"
         )
 
         for x in tqdm(parameter_values, desc=f"{x_name} steps"):
-            for stop in stop_range:
-                temp_df = self.df.copy()
-                para = copy.deepcopy(self.para)
+            temp_df = self.df.copy()
+            para = copy.deepcopy(self.para)
 
-                self._apply_parameter(para, x)
-                para.stop_multiplier_rate_long = stop
-                para.stop_multiplier_rate_short = stop
+            self._apply_parameter(para, x)
+            # stop_multiplier_rate_long/short are intentionally left
+            # untouched here -- they come from self.para as a fixed
+            # setting, not from a swept list.
 
-                temp_df = fun(temp_df, para=para, label_col=label_col)
+            temp_df = fun(temp_df, para=para, label_col=label_col)
 
-                if label_col not in temp_df.columns:
-                    raise ValueError(
-                        f"Label column '{label_col}' not found after calling label function."
-                    )
-
-                valid_df = temp_df[temp_df[label_col] != common.Signal.INVALID]
-
-                if len(valid_df) > 0:
-                    counts = valid_df[label_col].value_counts(normalize=True).to_dict()
-                else:
-                    counts = {}
-
-                row = {
-                    "parameter": x_name,
-                    "x": float(x),
-                    "stop_rate": stop,
-                    "label_type": para.label_type,
-                    "para_type": para.para_type,
-                    "vol_multiplier": float(para.vol_multiplier_long),
-                    "horizon": int(para.predict_num),
-                    "valid_count": int(len(valid_df)),
-                    "p_short": float(counts.get(common.Signal.NEGATIVE, 0.0)),
-                    "p_neutral": float(counts.get(common.Signal.NEUTRAL, 0.0)),
-                    "p_long": float(counts.get(common.Signal.POSITIVE, 0.0)),
-                }
-
-                g = self._gaussian_reference(np.array([float(x)]), para)
-                row.update(
-                    {
-                        "g_negative": float(g["negative"][0]),
-                        "g_neutral": float(g["neutral"][0]),
-                        "g_positive": float(g["positive"][0]),
-                    }
+            if label_col not in temp_df.columns:
+                raise ValueError(
+                    f"Label column '{label_col}' not found after calling label function."
                 )
-                sweep_data.append(row)
 
-        self.results_df = pd.DataFrame(sweep_data)
+            label_vals = temp_df[label_col].to_numpy()
+
+            # "Hard" invalid: insufficient future data, no direction
+            # information at all -- always excluded, no redistribution
+            # possible.
+            hard_invalid_mask = (label_vals == common.Signal.INVALID)
+            usable_vals = label_vals[~hard_invalid_mask]
+            n_usable = len(usable_vals)
+
+            n_amb = 0
+            if n_usable > 0:
+                n_pos = float(np.sum(usable_vals == common.Signal.POSITIVE))
+                n_neg = float(np.sum(usable_vals == common.Signal.NEGATIVE))
+                n_neu = float(np.sum(usable_vals == common.Signal.NEUTRAL))
+                n_amb = float(np.sum(usable_vals == common.Signal.AMBIGUOUS))
+
+                n_pos_adj = n_pos + 0.5 * n_amb
+                n_neg_adj = n_neg + 0.5 * n_amb
+
+                p_long = n_pos_adj / n_usable
+                p_short = n_neg_adj / n_usable
+                p_neutral = n_neu / n_usable
+            else:
+                p_long = p_short = p_neutral = 0.0
+
+            row = {
+                "parameter": x_name,
+                "x": float(x),
+                "stop_multiplier_rate_long": para.stop_multiplier_rate_long,
+                "stop_multiplier_rate_short": para.stop_multiplier_rate_short,
+                "label_type": para.label_type,
+                "para_type": para.para_type,
+                "vol_multiplier": float(para.vol_multiplier_long),
+                "horizon": int(para.predict_num),
+                "valid_count": int(n_usable),
+                "ambiguous_count": int(n_amb),
+                "p_short": float(p_short),
+                "p_neutral": float(p_neutral),
+                "p_long": float(p_long),
+            }
+
+            g = self._gaussian_reference(np.array([float(x)]), para)
+            row.update(
+                {
+                    "g_negative": float(g["negative"][0]),
+                    "g_neutral": float(g["neutral"][0]),
+                    "g_positive": float(g["positive"][0]),
+                }
+            )
+            sweep_data.append(row)
+
+        self.results_df = pd.DataFrame(sweep_data).sort_values("x").reset_index(drop=True)
         out_csv = os.path.join(self.output_dir, "label_ratio_sweep_results.csv")
         self.results_df.to_csv(out_csv, index=False)
         print(f"✅ Sweep completed: {len(self.results_df)} samples")
@@ -193,7 +232,27 @@ class LabelRatioCurveAnalyzer:
     # ------------------------------------------------------------------
     def _gaussian_reference(self, x, para):
         """
-        Zero-mean Gaussian null model.
+        Dispatch to the appropriate null model depending on the labeling
+        method being swept:
+          - FTHL: terminal-return distribution (endpoint-only, matches the
+            fixed-time-horizon label definition).
+          - TBM : path-dependent first-passage (touch-before-horizon)
+            distribution (matches the triple-barrier label definition).
+        These are genuinely different null models -- reusing the FTHL
+        formula for TBM compares path-dependent labels against a
+        reference derived for an endpoint-only rule, understating the
+        true null-model touch probability (by roughly a factor of ~2 in
+        the one-sided case, via the reflection principle).
+        """
+        x = np.asarray(x, dtype=float)
+        if self.label_type == "tbm":
+            return self._tbm_gaussian_reference(x, para)
+        return self._fthl_gaussian_reference(x, para)
+
+    def _fthl_gaussian_reference(self, x, para):
+        """
+        Zero-mean Gaussian null model for FTHL: terminal return
+        r_{t,h} ~ N(0, h * sigma_t^2).
 
         volatility sweep:
             z = vol_multiplier
@@ -206,8 +265,6 @@ class LabelRatioCurveAnalyzer:
             P(neg) = Phi(-z) = 1 - Phi(z)
             P(neu) = Phi(z) - Phi(-z)
         """
-        x = np.asarray(x, dtype=float)
-
         if self.para_type == "volatility":
             z = x
         elif self.para_type == "horizon":
@@ -225,6 +282,101 @@ class LabelRatioCurveAnalyzer:
             "negative": p_negative,
             "neutral": p_neutral,
         }
+
+    def _tbm_gaussian_reference(self, x, para):
+        """
+        Zero-mean Gaussian null model for a SYMMETRIC TBM: probability
+        that a driftless random walk with per-step std sigma_t touches
+        either of two symmetric barriers at +-tau_t = +-k*sigma_t within
+        h steps.
+
+        This is the classical two-sided first-passage ("Brownian motion
+        escaping a symmetric strip") problem. With z = tau_t / sigma_t = k
+        (the barrier distance in units of per-step volatility, independent
+        of h), the probability that NEITHER barrier is touched within h
+        steps is given by the eigenfunction-expansion solution of the
+        heat equation with Dirichlet boundary conditions at +-k:
+
+            P_neutral(k, h) = (4/pi) * sum_{n=0}^inf [(-1)^n / (2n+1)]
+                                * exp( -(2n+1)^2 * pi^2 * h / (8 * k^2) )
+
+        By symmetry (no drift, symmetric barriers), the probability of
+        touching the upper barrier first equals the probability of
+        touching the lower barrier first, each = (1 - P_neutral) / 2.
+
+        This closed form was numerically validated against a
+        fine-grained Monte Carlo simulation of the underlying random
+        walk (sub-stepping to approximate continuous monitoring) before
+        being adopted here; a coarse single-step-per-bar simulation
+        under-samples path extrema and will NOT match this formula
+        (known discrete-monitoring bias in first-passage problems).
+
+        Validity: this closed form assumes a single pair of symmetric
+        barriers, i.e. vol_multiplier_long == vol_multiplier_short AND
+        stop_multiplier_rate_long == stop_multiplier_rate_short == 1.0.
+        A mismatch triggers a warning; the curve is then only an
+        approximation and should not be used for crossing-point analysis
+        without noting this caveat.
+        """
+        stop_long = getattr(para, "stop_multiplier_rate_long", None)
+        stop_short = getattr(para, "stop_multiplier_rate_short", None)
+        symmetric = (
+            stop_long == 1.0
+            and stop_short == 1.0
+            and np.isclose(para.vol_multiplier_long, para.vol_multiplier_short)
+        )
+        if not symmetric:
+            import warnings
+            warnings.warn(
+                "TBM Gaussian null model assumes symmetric barriers "
+                "(vol_multiplier_long == vol_multiplier_short and "
+                "stop_multiplier_rate_long == stop_multiplier_rate_short == 1.0); "
+                "current parameters do not satisfy this, so the null curve "
+                "is only an approximation.",
+                stacklevel=2,
+            )
+
+        if self.para_type == "volatility":
+            k = x
+            h = np.full_like(x, float(para.predict_num))
+        elif self.para_type == "horizon":
+            k = np.full_like(x, float(para.vol_multiplier_long))
+            h = x
+        else:
+            raise ValueError(f"Unsupported para_type: {self.para_type}")
+
+        p_neutral = self._tbm_symmetric_survival_prob(k, h)
+        p_positive = (1.0 - p_neutral) / 2.0
+        p_negative = (1.0 - p_neutral) / 2.0
+
+        return {
+            "positive": p_positive,
+            "negative": p_negative,
+            "neutral": p_neutral,
+        }
+
+    @staticmethod
+    def _tbm_symmetric_survival_prob(k, h, n_terms=200):
+        """
+        Closed-form no-touch probability for a driftless random walk with
+        symmetric absorbing barriers at +-k (in units of per-step std),
+        observed over h steps. See `_tbm_gaussian_reference` docstring
+        for the formula and its derivation.
+        """
+        k = np.asarray(k, dtype=float)
+        h = np.asarray(h, dtype=float)
+
+        k_safe = np.where(k > 1e-8, k, 1e-8)
+        h_safe = np.where(h > 0, h, 1e-8)
+
+        n = np.arange(n_terms)
+        k_b = k_safe[..., None]
+        h_b = h_safe[..., None]
+        coeff = ((-1.0) ** n) / (2 * n + 1)
+        exponent = -((2 * n + 1) ** 2) * (np.pi ** 2) * h_b / (8.0 * k_b ** 2)
+        terms = coeff * np.exp(exponent)
+        survival = (4.0 / np.pi) * np.sum(terms, axis=-1)
+        return np.clip(survival, 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Derivative helpers
@@ -314,14 +466,27 @@ class LabelRatioCurveAnalyzer:
 
         return crossings[:max_points]
 
-    def _annotate_crossings(self, ax, crossings, color="black", prefix=""):
+    def _annotate_crossings(self, ax, crossings, color="black", prefix="", direction="up"):
         """
         Draw a marker + vertical guide line + text label for each crossing
         point found by `_find_crossings`. Only meant to decorate up to 2
         points, so labels are kept short ("1st crossing" / "2nd crossing").
+
+        `direction` fixes which side of the point the label sits on
+        ("up" or "down") for the WHOLE series passed in this call. This
+        must be tied to series identity (e.g. positive vs negative),
+        not to crossing order (1st vs 2nd) -- otherwise two different
+        series' 1st crossings both default to the same offset direction
+        and their labels overlap whenever the two crossing points are
+        close together in (x, y), which happens routinely for
+        positive/negative label-ratio curves crossing a shared Gaussian
+        reference. Within one direction, the 1st and 2nd crossing of the
+        SAME series are still separated via increasing horizontal/
+        vertical offset so they don't stack on each other either.
         """
         ordinal_labels = ["1st crossing", "2nd crossing"]
-        offsets = [(12, 14), (12, -22)]  # avoid overlapping text for close points
+        sign = 1 if direction == "up" else -1
+        offsets = [(12, sign * 14), (28, sign * 26)]
 
         for i, c in enumerate(crossings[:2]):
             label = f"{prefix}{ordinal_labels[i]}\nx={c['x']:.3f}"
@@ -361,23 +526,23 @@ class LabelRatioCurveAnalyzer:
 
         return x, empirical, gaussian, d1_emp, d1_gau, d2_emp, d2_gau
 
-    def _single_stop_subset(self, stop_rate):
+    def _sweep_df(self):
+        """
+        Return the sweep results, sorted by x. Replaces the old
+        `_single_stop_subset(stop_rate)` -- since stop_multiplier_rate
+        is now a single fixed value per analyzer instance (not swept),
+        there is nothing left to filter by; results_df already contains
+        exactly one row per swept x value.
+        """
         if self.results_df is None:
             raise RuntimeError("Please run run_parameter_sweep() first.")
-
-        df_plot = self.results_df[np.isclose(self.results_df["stop_rate"], stop_rate)].copy()
-        if df_plot.empty:
-            raise ValueError(f"No rows found for stop_rate={stop_rate}")
-
-        df_plot = df_plot.sort_values("x").reset_index(drop=True)
-        return df_plot
+        return self.results_df.sort_values("x").reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Plot public API
     # ------------------------------------------------------------------
     def plot_all_label_ratio_curves(
         self,
-        stop_rate=np.inf,
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
@@ -395,20 +560,17 @@ class LabelRatioCurveAnalyzer:
             output_dir = self.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        df_plot = self._single_stop_subset(stop_rate)
         saved_paths = {}
 
         # for class_name in ["positive", "negative", "neutral"]:
         #     saved_paths[class_name] = self.plot_single_label_ratio_curve(
         #         class_name=class_name,
-        #         stop_rate=stop_rate,
         #         output_dir=output_dir,
         #         smooth_window=smooth_window,
         #         include_gaussian=include_gaussian,
         #     )
 
         saved_paths["positive_negative"] = self.plot_positive_negative_ratio_curves(
-            stop_rate=stop_rate,
             output_dir=output_dir,
             smooth_window=smooth_window,
             include_gaussian=include_gaussian,
@@ -417,7 +579,6 @@ class LabelRatioCurveAnalyzer:
 
         saved_paths["neutral"] = self.plot_single_label_ratio_curve(
             class_name="neutral",
-            stop_rate=stop_rate,
             output_dir=output_dir,
             smooth_window=smooth_window,
             include_gaussian=include_gaussian,
@@ -425,7 +586,6 @@ class LabelRatioCurveAnalyzer:
         )
 
         overview_path = self.plot_distribution_overview(
-            stop_rate=stop_rate,
             output_dir=output_dir,
             smooth_window=smooth_window,
             include_gaussian=include_gaussian,
@@ -438,7 +598,6 @@ class LabelRatioCurveAnalyzer:
     def plot_single_label_ratio_curve(
         self,
         class_name,
-        stop_rate=np.inf,
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
@@ -453,7 +612,7 @@ class LabelRatioCurveAnalyzer:
             raise ValueError(f"class_name must be one of {list(self.CLASS_CONFIG)}")
 
         cfg = self.CLASS_CONFIG[class_name]
-        df_plot = self._single_stop_subset(stop_rate)
+        df_plot = self._sweep_df()
 
         x, empirical, gaussian, d1_emp, d1_gau, d2_emp, d2_gau = self._curve_data(
             df_plot=df_plot,
@@ -531,7 +690,6 @@ class LabelRatioCurveAnalyzer:
 
     def plot_positive_negative_ratio_curves(
         self,
-        stop_rate=np.inf,
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
@@ -552,7 +710,7 @@ class LabelRatioCurveAnalyzer:
             output_dir = self.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        df_plot = self._single_stop_subset(stop_rate)
+        df_plot = self._sweep_df()
 
         pos_cfg = self.CLASS_CONFIG["positive"]
         neg_cfg = self.CLASS_CONFIG["negative"]
@@ -655,7 +813,6 @@ class LabelRatioCurveAnalyzer:
 
     def plot_distribution_overview(
         self,
-        stop_rate=np.inf,
         output_dir=None,
         smooth_window=3,
         include_gaussian=True,
@@ -665,7 +822,7 @@ class LabelRatioCurveAnalyzer:
             output_dir = self.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        df_plot = self._single_stop_subset(stop_rate)
+        df_plot = self._sweep_df()
         x = df_plot["x"].to_numpy(dtype=float)
 
         fig, ax = plt.subplots(figsize=(12, 7))
@@ -835,8 +992,8 @@ class LabelRatioCurveAnalyzer:
                 crossings["positive_vs_gaussian"] = pos_crossings
                 crossings["negative_vs_gaussian"] = neg_crossings
 
-                self._annotate_crossings(ax, pos_crossings, color="darkgreen", prefix="Pos ")
-                self._annotate_crossings(ax, neg_crossings, color="darkred", prefix="Neg ")
+                self._annotate_crossings(ax, pos_crossings, color="darkgreen", prefix="Pos ", direction="up")
+                self._annotate_crossings(ax, neg_crossings, color="darkred", prefix="Neg ", direction="down")
 
         if add_zero_line:
             ax.axhline(0.0, color="black", linestyle=":", alpha=0.5)

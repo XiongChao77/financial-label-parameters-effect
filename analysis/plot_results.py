@@ -1851,10 +1851,10 @@ def load_and_plot(save_dir: str, pre_para: common.BaseDefine) -> None:
 
 if __name__ == "__main__":
     for pre_para in [
-        common.BTC_15m_fthl_volatility,
-        common.BTC_15m_fthl_horizon,
-        common.BTC_15m_tbm_volatility,
-        common.BTC_15m_tbm_horizon,
+        # common.BTC_15m_fthl_volatility,
+        # common.BTC_15m_fthl_horizon,
+        # common.BTC_15m_tbm_volatility,
+        # common.BTC_15m_tbm_horizon,
         ]:
         exp_dir = load_and_plot(common.TRAIN_OUT_DIR, pre_para)
         print(f"All plots regenerated under: {exp_dir}")

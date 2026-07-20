@@ -53,21 +53,21 @@ IMAGE_SPECS: List[Tuple[str, str, str]] = [
     ("Macro F1 (Balanced)", "train", "{model}/macro_f1_balanced.png"),
     ("Accuracy (Balanced)", "train", "{model}/accuracy_balanced.png"),
     ("MCC (Balanced)", "train", "{model}/mcc_balanced.png"),
-    ("Positive F1 (Balanced)", "train", "{model}/positive_f1_balanced.png"),
-    ("Positive Precision (Balanced)", "train", "{model}/positive_precision_balanced.png"),
-    ("Positive Recall (Balanced)", "train", "{model}/positive_recall_balanced.png"),
-    ("Negative F1 (Balanced)", "train", "{model}/negative_f1_balanced.png"),
-    ("Negative Precision (Balanced)", "train", "{model}/negative_precision_balanced.png"),
-    ("Negative Recall (Balanced)", "train", "{model}/negative_recall_balanced.png"),
+    # ("Positive F1 (Balanced)", "train", "{model}/positive_f1_balanced.png"),
+    # ("Positive Precision (Balanced)", "train", "{model}/positive_precision_balanced.png"),
+    # ("Positive Recall (Balanced)", "train", "{model}/positive_recall_balanced.png"),
+    # ("Negative F1 (Balanced)", "train", "{model}/negative_f1_balanced.png"),
+    # ("Negative Precision (Balanced)", "train", "{model}/negative_precision_balanced.png"),
+    # ("Negative Recall (Balanced)", "train", "{model}/negative_recall_balanced.png"),
     ("Macro F1 (Raw)", "train", "{model}/macro_f1_raw.png"),
     ("Accuracy (Raw)", "train", "{model}/accuracy_raw.png"),
-    ("Positive F1 (Raw)", "train", "{model}/positive_f1_raw.png"),
-    ("Positive Precision (Raw)", "train", "{model}/positive_precision_raw.png"),
-    ("Positive Recall (Raw)", "train", "{model}/positive_recall_raw.png"),
-    ("Negative F1 (Raw)", "train", "{model}/negative_f1_raw.png"),
-    ("Negative Precision (Raw)", "train", "{model}/negative_precision_raw.png"),
-    ("Negative Recall (Raw)", "train", "{model}/negative_recall_raw.png"),
     ("MCC (Raw)", "train", "{model}/mcc_raw.png"),
+    # ("Positive F1 (Raw)", "train", "{model}/positive_f1_raw.png"),
+    # ("Positive Precision (Raw)", "train", "{model}/positive_precision_raw.png"),
+    # ("Positive Recall (Raw)", "train", "{model}/positive_recall_raw.png"),
+    # ("Negative F1 (Raw)", "train", "{model}/negative_f1_raw.png"),
+    # ("Negative Precision (Raw)", "train", "{model}/negative_precision_raw.png"),
+    # ("Negative Recall (Raw)", "train", "{model}/negative_recall_raw.png"),
     ("Financial Signal Avg Return (fee=0)", "train", "{model}/financial_return/financial_signal_avg_return_fee_0.000000.png"),
     ("Financial Strategy Total Return (fee=0)", "train", "{model}/financial_return/financial_strategy_total_return_fee_0.000000.png"),
 ]
@@ -267,45 +267,43 @@ def _load_cross_eval_summary(pre_para, save_dir=None):
 
 CURVE_SOURCES = {
     "self":        {"x_col": "threshold",       "suffix": "_mean",
-                     "loader": lambda p, sd: crossing_specificity.load_self_eval(p, sd)[0]},
+                     "loader": lambda p, sd: crossing_specificity.load_self_eval(p, sd)},
     "cross_train": {"x_col": "train_threshold",  "suffix": "_mean_mean", "loader": _load_cross_train_summary},
     "cross_eval":  {"x_col": "eval_threshold",   "suffix": "_mean_mean", "loader": _load_cross_eval_summary},
     "financial":   {"x_col": "threshold",        "suffix": "_mean",
-                     "loader": lambda p, sd: crossing_specificity.load_financial(p, sd)[0]},
+                     "loader": lambda p, sd: crossing_specificity.load_financial(p, sd)},
 }
 
 # title -> list of (curve_key, base_metric_name, extra_filter). base_metric
 # names are shared across self/cross_train/cross_eval (train.py uses the
 # same {base} for all three, just different suffixes).
 _SELF_EVAL_FAMILY_METRICS = {
-    "Macro F1":            "macro_f1",
-    "Accuracy":            "accuracy",
-    "MCC":                 "mcc",
-    "Positive F1":         "f_pos",
-    "Positive Precision":  "p_pos",
-    "Positive Recall":     "r_pos",
-    "Negative F1":         "f_neg",
-    "Negative Precision":  "p_neg",
-    "Negative Recall":     "r_neg",
+    "Macro F1": "macro_f1",
+    "Accuracy": "accuracy",
+    "MCC":      "mcc",
 }
 
 IMAGE_CURVES = {}
 for _name, _base in _SELF_EVAL_FAMILY_METRICS.items():
-    for _mode in ("Balanced", "Raw"):
-        _eval_mode = _mode.lower()
-        _title = f"{_name} ({_mode})"
-        _filter = {"eval_mode": _eval_mode}
-        IMAGE_CURVES[_title] = [
-            ("self", _base, _filter),
-            ("cross_train", _base, _filter),
-            ("cross_eval", _base, _filter),
-        ]
-IMAGE_CURVES["Financial Signal Avg Return (fee=0)"] = [
-    ("financial", "signal_avg_return", {"fee_rate": 0.0}),
-]
-IMAGE_CURVES["Financial Strategy Total Return (fee=0)"] = [
-    ("financial", "strategy_total_return", {"fee_rate": 0.0}),
-]
+    # Cross-model similarity is restricted to the balanced evaluation mode
+    # only -- raw (unbalanced) curves are excluded here by design, since
+    # class-imbalance artifacts across parameter values can distort
+    # curve-shape comparisons unrelated to genuine model agreement.
+    _eval_mode = "balanced"
+    _title = f"{_name} (Balanced)"
+    _filter = {"eval_mode": _eval_mode}
+    IMAGE_CURVES[_title] = [
+        ("self", _base, _filter),
+        ("cross_train", _base, _filter),
+        ("cross_eval", _base, _filter),
+    ]
+# Financial curves (signal_avg_return, strategy_total_return) are
+# intentionally excluded from cross-model similarity comparison: this
+# analysis asks whether models AGREE on classification structure, which is
+# a different question from whether their financial outcomes agree, and
+# mixing the two would let a financial-return disagreement (a separate,
+# already-documented phenomenon) masquerade as a classification-consistency
+# problem or vice versa.
 
 
 def _per_model_image_specs():
@@ -359,16 +357,16 @@ def _curve_similarity(curve_a: pd.DataFrame, curve_b: pd.DataFrame) -> dict:
 
 
 def analyze_curve_similarity(pre_para, models=tuple(MODELS), save_dir=None) -> pd.DataFrame:
-    """For every curve (Self / Cross Train / Cross Eval / Financial) in every
-    per-model panel of IMAGE_SPECS, compare every pair of models."""
+    """For every curve defined in IMAGE_CURVES (currently: Self / Cross Train
+    / Cross Eval, balanced evaluation mode only -- see IMAGE_CURVES), compare
+    every pair of models. Iterates IMAGE_CURVES directly rather than
+    IMAGE_SPECS/_per_model_image_specs(), so this comparison's scope is
+    governed solely by IMAGE_CURVES and stays in sync automatically if that
+    mapping is edited, independent of which images IMAGE_SPECS composes into
+    the report grids."""
     rows = []
-    for title, root, rel_path_tpl in _per_model_image_specs():
-        if title not in IMAGE_CURVES:
-            print(f"[skip] no curve mapping for image title: {title!r} "
-                  f"(add it to IMAGE_CURVES)")
-            continue
-
-        for curve_key, base_metric, extra_filter in IMAGE_CURVES[title]:
+    for title, curve_specs in IMAGE_CURVES.items():
+        for curve_key, base_metric, extra_filter in curve_specs:
             curves = {}
             for model in models:
                 try:
@@ -438,8 +436,8 @@ def model_performance_score(pre_para, models=tuple(MODELS), eval_mode="balanced"
     financial_return_summary (fixed fee_rate). This is the OTHER axis for
     picking a representative model: representativeness (above) says which
     model is most "typical"; this says which model actually performs best."""
-    self_summary, _ = crossing_specificity.load_self_eval(pre_para, save_dir)
-    fin_summary, _ = crossing_specificity.load_financial(pre_para, save_dir)
+    self_summary = crossing_specificity.load_self_eval(pre_para, save_dir)
+    fin_summary = crossing_specificity.load_financial(pre_para, save_dir)
 
     rows = []
     for m in models:
@@ -509,6 +507,40 @@ def _group_report_dir(pre_para):
     )
 
 
+def per_group_overall_similarity(detail, value_col="spearman_r", weight_col="n_matched") -> pd.DataFrame:
+    """
+    One row per experimental group (symbol/interval/label_type/para_type),
+    giving that group's own weighted-mean spearman_r across every curve x
+    model-pair comparison within it -- i.e. "how consistent were the three
+    models with each other in THIS group?" A final 'ALL GROUPS' row is
+    appended using every row in `detail` together, giving the single
+    headline number (identical to what overall_similarity_score() returns
+    on the full detail table) for direct comparison against the per-group
+    rows. This is the table meant for direct inclusion in the dissertation.
+    """
+    group_cols = ["symbol", "interval", "label_type", "para_type"]
+    rows = []
+    for keys, sub in detail.groupby(group_cols):
+        sub = sub.dropna(subset=[value_col, weight_col])
+        if sub.empty or sub[weight_col].sum() == 0:
+            score = np.nan
+        else:
+            score = float(np.average(sub[value_col], weights=sub[weight_col]))
+        row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+        row["n_comparisons"] = int(len(sub))
+        row["mean_spearman_r"] = score
+        rows.append(row)
+
+    out = pd.DataFrame(rows).sort_values(group_cols).reset_index(drop=True)
+
+    overall = overall_similarity_score(detail, value_col=value_col, weight_col=weight_col)
+    overall_row = {c: "ALL GROUPS" if c == "symbol" else "" for c in group_cols}
+    overall_row["n_comparisons"] = int(detail.dropna(subset=[value_col, weight_col]).shape[0])
+    overall_row["mean_spearman_r"] = overall
+    out = pd.concat([out, pd.DataFrame([overall_row])], ignore_index=True)
+    return out
+
+
 CURVE_SIMILARITY_REPORT_DIR = os.path.join(common.OUTPUT_DIR, "model_curve_similarity_report")
 
 
@@ -572,10 +604,23 @@ def aggregate_curve_similarity(paras=None, models=tuple(MODELS), save_dir=None, 
     print(f"detail (all groups) saved: {detail_path}")
     print(f"summary (all groups) saved: {summary_path}")
 
+    overall_df = per_group_overall_similarity(detail)
+    overall_path = os.path.join(report_dir, "model_curve_similarity_overall.csv")
+    overall_df.to_csv(overall_path, index=False)
+    print(f"per-group + overall similarity saved: {overall_path}")
+
+    overall_img_path = os.path.join(report_dir, "model_curve_similarity_overall.png")
+    rows = [overall_df.columns.tolist()] + [
+        [_fmt(v) for v in row] for row in overall_df.itertuples(index=False)
+    ]
+    render_table_image(rows, overall_img_path, "model_curve_similarity_overall",
+                        col_width=220, row_height=36, font_size=16)
+    print(f"per-group + overall similarity table image saved: {overall_img_path}")
+
     score = overall_similarity_score(detail)
     print(f"overall weighted cross-model consistency score (spearman_r): {score:.3f}")
 
-    return detail, summary, score
+    return detail, summary, overall_df, score
 
 
 # ======================================================================
@@ -691,4 +736,4 @@ if __name__ == "__main__":
     # output/model_curve_similarity_report/, 2 CSVs + one printed overall
     # score): run this separately once every group has been through
     # run_compose_report at least once.
-    detail_all, summary_all, overall_score = aggregate_curve_similarity(paras = paras)
+    detail_all, summary_all, overall_all, overall_score = aggregate_curve_similarity(paras = paras)

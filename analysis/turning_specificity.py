@@ -201,6 +201,8 @@ def find_turning_points(x, y, window_length=None, polyorder=3,
 # ------------------------------------------------------------------
 
 _CURVE_ABBR = {"ratio": "ratio", "first_derivative": "d1", "second_derivative": "d2"}
+_SERIES_ABBR = {"positive_vs_gaussian": "pos", "negative_vs_gaussian": "neg",
+                "empirical_vs_gaussian": "emp"}
 
 
 def _format_turning_points(turning_points):
@@ -208,50 +210,24 @@ def _format_turning_points(turning_points):
     return "; ".join(f"{tx:.3f}({k})" for tx, k in turning_points)
 
 
-def _average_pos_neg_crossings(crossings_df):
-    """
-    Average the positive_vs_gaussian and negative_vs_gaussian crossing x
-    values together for each (curve, crossing_order) pair, and drop the
-    empirical_vs_gaussian series entirely (that series comes from the
-    NEUTRAL-class ratio curve, not a positive/negative combination -- see
-    plot_single_label_ratio_curve(class_name="neutral") in
-    LabelRatioCurveAnalyzer).
-
-    This exists because ML performance curves (macro F1, MCC, etc.) have
-    no positive/negative direction of their own -- comparing their turning
-    points against the positive- and negative-side crossings separately
-    doesn't correspond to anything meaningful on the performance side. The
-    two directional crossings are averaged into one representative point
-    per (curve, order) instead, which is what the performance turning
-    points are actually compared against.
-
-    Returns a DataFrame with columns [curve, crossing_order, x].
-    """
-    pn = crossings_df[crossings_df["series"].isin(
-        ["positive_vs_gaussian", "negative_vs_gaussian"]
-    )]
-    if pn.empty:
-        return pn[["curve", "crossing_order", "x"]] if "curve" in pn.columns else pn
-    return (
-        pn.groupby(["curve", "crossing_order"], as_index=False)["x"]
-        .mean()
-        .sort_values("x")
-    )
-
-
 def _format_crossings(crossings_df):
     """
-    'x0(curve_abbr,order); x1(...); ...' sorted by x, after averaging the
-    positive/negative crossings together (see _average_pos_neg_crossings)
-    and dropping the neutral-class crossings.
+    'x0(curve_abbr,series_abbr,order); x1(...); ...' sorted by x, so the
+    reader can see both WHERE each crossing is and WHAT kind of crossing it
+    is (raw ratio / 1st derivative / 2nd derivative; empirical / positive /
+    negative vs the Gaussian reference; 1st or 2nd crossing along the
+    parameter sweep) without needing a separate lookup table.
     """
-    avg = _average_pos_neg_crossings(crossings_df)
-    if avg.empty:
+    if crossings_df.empty:
         return ""
+    rows = crossings_df.sort_values("x")
     parts = []
-    for r in avg.itertuples():
+    for r in rows.itertuples():
         curve_abbr = _CURVE_ABBR.get(r.curve, r.curve)
-        parts.append(f"{r.x:.3f}({curve_abbr},{r.crossing_order})")
+        series_abbr = _SERIES_ABBR.get(getattr(r, "series", "empirical_vs_gaussian"),
+                                        getattr(r, "series", ""))
+        order = getattr(r, "crossing_order", "")
+        parts.append(f"{r.x:.3f}({curve_abbr},{series_abbr},{order})")
     return "; ".join(parts)
 
 
@@ -292,7 +268,7 @@ def analyze_group(para, table_name, metric_col, group_filter,
         "window_length_used": window_used,
         "turning_point_count": len(turning_points),
         "turning_points": _format_turning_points(turning_points),
-        "crossing_point_count": len(_average_pos_neg_crossings(crossings)),
+        "crossing_point_count": len(crossings),
         "crossing_points": _format_crossings(crossings),
         "table": table_name,
         "metric": metric_col,

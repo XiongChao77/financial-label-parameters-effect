@@ -308,8 +308,20 @@ def compute_financial_returns_tbm(
                 hit_sl = l <= sl_price
                 hit_tp = h >= tp_price
 
-                # Stop-loss priority.
-                # If TP and SL are touched in the same K-line, SL wins.
+                # If both TP and SL are touched within the same K-line, the
+                # true intrabar order is unknown. Previously resolved with a
+                # pessimistic "SL always wins" rule, which introduces a
+                # systematic negative bias concentrated at narrow thresholds
+                # (small k), where TP/SL sit inside a single bar's typical
+                # range. Treated as a scratch instead: exit at entry price
+                # (zero gross return before fees), rather than assuming
+                # either side.
+                if hit_sl and hit_tp:
+                    ex_i = j
+                    ex_price = entry_price
+                    reason = "long_ambiguous"
+                    break
+
                 if hit_sl:
                     ex_i = j
                     ex_price = sl_price
@@ -368,6 +380,15 @@ def compute_financial_returns_tbm(
 
                 hit_sl = h >= sl_price
                 hit_tp = l <= tp_price
+
+                # Same ambiguity as the long path above: same-bar double
+                # touch is unresolvable, so treat it as a scratch (exit at
+                # entry price) instead of assuming SL.
+                if hit_sl and hit_tp:
+                    ex_i = j
+                    ex_price = entry_price
+                    reason = "short_ambiguous"
+                    break
 
                 # Stop-loss priority.
                 if hit_sl:
@@ -534,6 +555,9 @@ def compute_financial_returns_tbm(
                 ),
                 "tbm_timeout_count": int(
                     sum(reason.endswith("_timeout") for reason in trade_exit_reason)
+                ),
+                "tbm_ambiguous_count": int(
+                    sum(reason.endswith("_ambiguous") for reason in trade_exit_reason)
                 ),
             }
         )
@@ -1445,7 +1469,7 @@ def run_single_iteration(
                 df=df, pre_para=pre_para, para_horizon=para_horizon,
                 window_indices=window_indices, sample_idx=test_idx,
                 y_pred=y_test_pred, label_col=col_name,
-                initial_cash=10000.0, fee_rates=[0.0, 0.0005], price_col="close",
+                initial_cash=10000.0, fee_rates=[0], price_col="close",
             )
             end_time = time.time()
             logger.info(f"compute_financial_returns takes time: {(end_time - begin_time):.2f} seconds")
@@ -1518,7 +1542,7 @@ def run_fixed_neutral_subsampling_experiment(
 
     logger.info(f"Master windows M={M} | train={len(train_idx)} | val={len(val_idx)} | test={len(test_idx)}")
 
-    total_runs = 50
+    total_runs = 30
 
     strictest_train_target_n = np.inf
     strictest_val_target_n = np.inf
@@ -1836,7 +1860,7 @@ def main(
         pre_para=pre_para,
         prep_output_dir=prep_output_dir,
         save_dir=save_dir,
-        max_workers = 25
+        max_workers = 30
     )
 
 if __name__ == "__main__":

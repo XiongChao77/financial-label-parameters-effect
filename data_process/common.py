@@ -13,10 +13,11 @@ from data_process.feature import *
 from numba import njit
 
 class Signal(IntEnum):
-    INVALID = -1
+    AMBIGUOUS = -2   # 同一根K线内上下界同时触碰，OHLC分辨率下无法判定先后顺序
+    INVALID = -1     # 数据不足（未来K线缺失），与AMBIGUOUS的"不可用"原因不同
     NEGATIVE = 0
     NEUTRAL = 1
-    POSITIVE  = 2
+    POSITIVE = 2
 
 eps = 1e-8
 
@@ -376,7 +377,6 @@ def attach_fthl_label(df, para = BaseDefine(), label_col = 'label'):
     df = calculate_thresholds(df, para)
 
     # 2. Physical time anchoring (unchanged)
-    df['open_time_sn'] = df[time_col]// interval_ms
     target_times = time_values + (para.predict_num * interval_ms)
     target_indices = np.searchsorted(time_values, target_times, side='left')
     in_bounds = target_indices < len(df)
@@ -510,7 +510,7 @@ def calculate_us_stock_mins_thresholds(df, para=BaseDefine):
 def fast_triple_barrier_kernel(close, high, low, thresholds, window):
     n = len(close)
     labels = np.ones(n, dtype=np.int32)         # 默认中性 (1)
-    reach_times = np.full(n, window, dtype=np.int32) # 默认到期窗口长度
+    reach_times = np.full(n, window, dtype=np.int32)
 
     l_tp_p = thresholds[:, 0]
     l_sl_p = thresholds[:, 1]
@@ -519,39 +519,42 @@ def fast_triple_barrier_kernel(close, high, low, thresholds, window):
 
     for i in range(n - window):
         p0 = close[i]
-        
-        # 独立的价格屏障
+
         l_tp = p0 * (1 + l_tp_p[i])
         l_sl = p0 * (1 - l_sl_p[i])
         s_tp = p0 * (1 - s_tp_p[i])
         s_sl = p0 * (1 + s_sl_p[i])
-        
-        # 用来记录该样本在窗口内达成 TP 或 SL 的最早步数
+
         first_l_tp = window + 1
         first_s_tp = window + 1
         first_l_sl = window + 1
         first_s_sl = window + 1
-        
+
         l_active = True
         s_active = True
+        # 记录“同一根K线内上下界同时被触碰”这一无法判定方向的事件
+        # 最早发生在第几步；默认视为“未发生”（window+1）
+        ambiguous_step = window + 1
 
         for j in range(1, window + 1):
             curr_idx = i + j
             h, l = high[curr_idx], low[curr_idx]
-            
+
             # --- 多头路径判定 ---
             if l_active:
                 hit_l_tp = (h >= l_tp)
                 hit_l_sl = (l <= l_sl)
-                
+
                 if hit_l_tp and hit_l_sl:
-                    # 极端波动：单根K线同时触碰止盈与止损
-                    # 秉持悲观原则，假设先被止损
+                    # 同一根K线同时触碰止盈与止损：从OHLC数据无法判断
+                    # 谁先发生，标记为存在歧义，不再用悲观假设强行归入止损
+                    if j < ambiguous_step:
+                        ambiguous_step = j
                     first_l_sl = j
-                    l_active = False 
+                    l_active = False
                 elif hit_l_sl:
                     first_l_sl = j
-                    l_active = False 
+                    l_active = False
                 elif hit_l_tp:
                     first_l_tp = j
                     l_active = False
@@ -560,10 +563,10 @@ def fast_triple_barrier_kernel(close, high, low, thresholds, window):
             if s_active:
                 hit_s_tp = (l <= s_tp)
                 hit_s_sl = (h >= s_sl)
-                
+
                 if hit_s_tp and hit_s_sl:
-                    # 极端波动：单根K线同时触碰止盈与止损
-                    # 秉持悲观原则，假设先被止损
+                    if j < ambiguous_step:
+                        ambiguous_step = j
                     first_s_sl = j
                     s_active = False
                 elif hit_s_sl:
@@ -573,31 +576,36 @@ def fast_triple_barrier_kernel(close, high, low, thresholds, window):
                     first_s_tp = j
                     s_active = False
 
-            # 如果多空都已经有了明确结果（无论触碰了TP还是SL），提前退出循环
             if not l_active and not s_active:
                 break
 
         # --- 最终决策逻辑 ---
-        # 规则 1：多头获胜条件 —— 多头触碰过 TP，且步数严格领先于空头触发 TP 的步数
-        if first_l_tp <= window and first_l_tp < first_s_tp:
-            labels[i] = 2 # Signal.POSITIVE
+        # 规则 0：若最早的“解决事件”是同K线双触发的歧义事件（早于或等于
+        # 任何一方干净触发止盈的时刻），说明真实方向从OHLC数据无法恢复，
+        # 直接标记为 AMBIGUOUS，不参与后续 NEUTRAL/POSITIVE/NEGATIVE 的判定
+        if ambiguous_step <= window and ambiguous_step <= first_l_tp and ambiguous_step <= first_s_tp:
+            labels[i] = -2  # Signal.AMBIGUOUS
+            reach_times[i] = ambiguous_step
+
+        # 规则 1：多头获胜条件
+        elif first_l_tp <= window and first_l_tp < first_s_tp:
+            labels[i] = 2  # Signal.POSITIVE
             reach_times[i] = first_l_tp
-            
-        # 规则 2：空头获胜条件 —— 空头触碰过 TP，且步数严格领先于多头触发 TP 的步数
+
+        # 规则 2：空头获胜条件
         elif first_s_tp <= window and first_s_tp < first_l_tp:
-            labels[i] = 0 # Signal.NEGATIVE
+            labels[i] = 0  # Signal.NEGATIVE
             reach_times[i] = first_s_tp
-            
+
         # 规则 3：双输、双触或均未触发 —— 判定为中性
         else:
-            labels[i] = 1 # Signal.NEUTRAL
-            # 如果是中性标签，这里记录下最早发生止损的步数，方便回测引擎做非重叠仓位的时间跨度截断
+            labels[i] = 1  # Signal.NEUTRAL
             min_sl = min(first_l_sl, first_s_sl)
             if min_sl <= window:
                 reach_times[i] = min_sl
             else:
                 reach_times[i] = window
-                
+
     return labels, reach_times
 
 def attach_tbm_label(df, para=BaseDefine(), label_col = 'label'):
@@ -677,7 +685,7 @@ def print_label_performance_stats(df, para=BaseDefine):
 
     # 2. 标签分布统计
     label_counts = valid_df['label'].value_counts().sort_index()
-    label_map = {0: "NEGATIVE (Short Win)", 1: "NEUTRAL (Time-out/SL)", 2: "POSITIVE (Long Win)"}
+    label_map = {0: "NEGATIVE (Short Win)", 1: "NEUTRAL (Time-out/SL)", 2: "POSITIVE (Long Win)", -2: "AMBIGUOUS (same-bar double touch, excluded from training)",}
     
     print(f"{'Label Type':<25} | {'Count':<10} | {'Percentage':<10}")
     for lbl, count in label_counts.items():
