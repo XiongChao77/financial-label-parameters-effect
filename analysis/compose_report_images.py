@@ -76,6 +76,7 @@ MODELS = ['DecisionTree', 'LogisticRegression', 'LSTM']
 N_COLS = 3
 THUMB_WIDTH = 900
 REPORT_OUTPUT_DIR = os.path.join(common.OUTPUT_DIR, "composed_report")
+N_REPEATED_RUNS = 30
 
 
 def resolve_base_dir(pre_para: common.BaseDefine, root: str) -> str:
@@ -263,6 +264,211 @@ def _load_cross_train_summary(pre_para, save_dir=None):
 def _load_cross_eval_summary(pre_para, save_dir=None):
     d = crossing_specificity.train_dir(pre_para, save_dir)
     return pd.read_csv(os.path.join(d, "cross_eval_batch_summary_mean_std.csv"))
+
+
+# ======================================================================
+# Across-run variability (30 repeated training/evaluation runs)
+# ======================================================================
+
+VARIABILITY_CURVES = {
+    "Macro F1 (Balanced)": [
+        ("self", "macro_f1", {"eval_mode": "balanced"}),
+        ("cross_train", "macro_f1", {"eval_mode": "balanced"}),
+        ("cross_eval", "macro_f1", {"eval_mode": "balanced"}),
+    ],
+    "Accuracy (Balanced)": [
+        ("self", "accuracy", {"eval_mode": "balanced"}),
+        ("cross_train", "accuracy", {"eval_mode": "balanced"}),
+        ("cross_eval", "accuracy", {"eval_mode": "balanced"}),
+    ],
+    "MCC (Balanced)": [
+        ("self", "mcc", {"eval_mode": "balanced"}),
+        ("cross_train", "mcc", {"eval_mode": "balanced"}),
+        ("cross_eval", "mcc", {"eval_mode": "balanced"}),
+    ],
+    "Financial Signal Avg Return (fee=0)": [
+        ("financial", "signal_avg_return", {"fee_rate": 0.0}),
+    ],
+    "Financial Strategy Total Return (fee=0)": [
+        ("financial", "strategy_total_return", {"fee_rate": 0.0}),
+    ],
+}
+
+
+def _variability_columns(summary: pd.DataFrame, curve_key: str, base_metric: str):
+    """Return the mean/std columns written by train.py for one curve source.
+
+    Cross-train and cross-eval tables aggregate a per-run mean, hence their
+    columns are named ``*_mean_mean`` and ``*_mean_std``. Self-evaluation and
+    financial tables use the simpler ``*_mean`` and ``*_std`` convention.
+    """
+    if curve_key in {"cross_train", "cross_eval"}:
+        mean_col = f"{base_metric}_mean_mean"
+        std_col = f"{base_metric}_mean_std"
+    else:
+        mean_col = f"{base_metric}_mean"
+        std_col = f"{base_metric}_std"
+
+    missing = [c for c in (mean_col, std_col) if c not in summary.columns]
+    if missing:
+        raise KeyError(
+            f"Missing variability column(s) {missing}; available columns: "
+            f"{list(summary.columns)}"
+        )
+    return mean_col, std_col
+
+
+def analyze_run_variability(pre_para, models=tuple(MODELS), save_dir=None) -> pd.DataFrame:
+    """Collect mean, standard deviation and variance across the 30 runs.
+
+    One row is emitted for every experimental group x panel x curve source x
+    model x parameter value. Variance is derived from the stored across-run
+    standard deviation, so this function preserves the existing report
+    workflow and does not rerun model training.
+    """
+    rows = []
+    for image_title, curve_specs in VARIABILITY_CURVES.items():
+        for curve_key, base_metric, extra_filter in curve_specs:
+            src = CURVE_SOURCES[curve_key]
+            try:
+                summary = src["loader"](pre_para, save_dir)
+                mean_col, std_col = _variability_columns(summary, curve_key, base_metric)
+            except Exception as e:
+                print(f"[skip variability] {image_title}/{curve_key}: {e}")
+                continue
+
+            x_col = src["x_col"]
+            for model in models:
+                sub = summary[summary["model"] == model].copy()
+                for key, value in extra_filter.items():
+                    if key not in sub.columns:
+                        sub = sub.iloc[0:0]
+                        break
+                    sub = sub[np.isclose(sub[key], value) if pd.api.types.is_numeric_dtype(sub[key])
+                              else sub[key] == value]
+                if sub.empty:
+                    print(f"[skip variability] no rows for {image_title}/{curve_key}/{model}")
+                    continue
+
+                sub = sub.sort_values(x_col)
+                true_x = crossing_specificity._true_x(
+                    sub[x_col].to_numpy(dtype=float), pre_para.para_type
+                )
+                for x, mean_value, std_value in zip(true_x, sub[mean_col], sub[std_col]):
+                    std_value = float(std_value) if pd.notna(std_value) else np.nan
+                    rows.append({
+                        "symbol": pre_para.symbol,
+                        "interval": pre_para.interval,
+                        "label_type": pre_para.label_type,
+                        "para_type": pre_para.para_type,
+                        "image_title": image_title,
+                        "curve": curve_key,
+                        "metric": base_metric,
+                        "model": model,
+                        "parameter_value": float(x),
+                        "n_repeated_runs": N_REPEATED_RUNS,
+                        "mean": float(mean_value) if pd.notna(mean_value) else np.nan,
+                        "std": std_value,
+                        "variance": std_value ** 2 if pd.notna(std_value) else np.nan,
+                    })
+    return pd.DataFrame(rows)
+
+
+def summarize_run_variability(detail: pd.DataFrame) -> pd.DataFrame:
+    """Summarize variability over the parameter sweep for each curve/model.
+
+    ``ntr_percent`` is the noise-to-range ratio::
+
+        mean_lambda(std_lambda)
+        ----------------------- * 100
+        max_lambda(mean_lambda) - min_lambda(mean_lambda)
+
+    It compares average repeated-run noise with the total performance change
+    over the parameter sweep. NTR is undefined when the mean curve has zero
+    range; those groups are stored as NaN instead of infinity.
+    """
+    group_cols = [
+        "symbol", "interval", "label_type", "para_type",
+        "image_title", "curve", "metric", "model",
+    ]
+    if detail.empty:
+        return pd.DataFrame(columns=group_cols + [
+            "n_parameter_values", "n_repeated_runs", "mean_std",
+            "median_std", "max_std", "mean_variance", "max_variance",
+            "min_mean", "max_mean", "mean_range", "ntr_percent",
+        ])
+    summary = (
+        detail.groupby(group_cols, dropna=False)
+        .agg(
+            n_parameter_values=("parameter_value", "nunique"),
+            n_repeated_runs=("n_repeated_runs", "max"),
+            mean_std=("std", "mean"),
+            median_std=("std", "median"),
+            max_std=("std", "max"),
+            mean_variance=("variance", "mean"),
+            max_variance=("variance", "max"),
+            min_mean=("mean", "min"),
+            max_mean=("mean", "max"),
+        )
+        .reset_index()
+    )
+    summary["mean_range"] = summary["max_mean"] - summary["min_mean"]
+    valid_range = summary["mean_range"].notna() & (summary["mean_range"] > 0)
+    summary["ntr_percent"] = np.nan
+    summary.loc[valid_range, "ntr_percent"] = (
+        summary.loc[valid_range, "mean_std"]
+        / summary.loc[valid_range, "mean_range"]
+        * 100.0
+    )
+    return summary.sort_values(group_cols)
+
+
+def save_run_variability(pre_para, models=tuple(MODELS), save_dir=None,
+                         out_dir=None):
+    """Write detailed and summarized 30-run variability CSVs for one group."""
+    out_dir = out_dir or _group_report_dir(pre_para)
+    os.makedirs(out_dir, exist_ok=True)
+    detail = analyze_run_variability(pre_para, models=models, save_dir=save_dir)
+    summary = summarize_run_variability(detail)
+
+    detail_path = os.path.join(out_dir, "run_variability_detail.csv")
+    summary_path = os.path.join(out_dir, "run_variability_summary.csv")
+    detail.to_csv(detail_path, index=False)
+    summary.to_csv(summary_path, index=False)
+    print(f"30-run variability detail saved: {detail_path}")
+    print(f"30-run variability summary saved: {summary_path}")
+    return detail, summary
+
+
+def aggregate_run_variability(paras, models=tuple(MODELS), save_dir=None,
+                              report_dir=None):
+    """Combine all groups' variability into two dissertation-level CSVs."""
+    report_dir = report_dir or os.path.join(common.OUTPUT_DIR, "run_variability_report")
+    os.makedirs(report_dir, exist_ok=True)
+    details = []
+    for para in paras:
+        cached_path = os.path.join(_group_report_dir(para), "run_variability_detail.csv")
+        try:
+            detail = (pd.read_csv(cached_path) if os.path.exists(cached_path)
+                      else analyze_run_variability(para, models=models, save_dir=save_dir))
+            if not detail.empty:
+                details.append(detail)
+        except Exception as e:
+            print(f"[skip variability group] {para.symbol}_{para.interval}/"
+                  f"{para.label_type}/{para.para_type}: {e}")
+
+    if not details:
+        raise RuntimeError("No experimental group produced variability statistics.")
+
+    detail_all = pd.concat(details, ignore_index=True)
+    summary_all = summarize_run_variability(detail_all)
+    detail_path = os.path.join(report_dir, "run_variability_detail_all_groups.csv")
+    summary_path = os.path.join(report_dir, "run_variability_summary_all_groups.csv")
+    detail_all.to_csv(detail_path, index=False)
+    summary_all.to_csv(summary_path, index=False)
+    print(f"all-group 30-run variability detail saved: {detail_path}")
+    print(f"all-group 30-run variability summary saved: {summary_path}")
+    return detail_all, summary_all
 
 
 CURVE_SOURCES = {
@@ -536,6 +742,7 @@ def per_group_overall_similarity(detail, value_col="spearman_r", weight_col="n_m
     overall = overall_similarity_score(detail, value_col=value_col, weight_col=weight_col)
     overall_row = {c: "ALL GROUPS" if c == "symbol" else "" for c in group_cols}
     overall_row["n_comparisons"] = int(detail.dropna(subset=[value_col, weight_col]).shape[0])
+    n_comparisons = overall_row["n_comparisons"]
     overall_row["mean_spearman_r"] = overall
     out = pd.concat([out, pd.DataFrame([overall_row])], ignore_index=True)
     return out
@@ -669,6 +876,14 @@ def run_compose_report(pre_para):
     os.makedirs(out_dir, exist_ok=True)
     base_title = f"{pre_para.symbol}_{pre_para.interval}_{pre_para.label_type}_{pre_para.para_type}"
 
+    # Save uncertainty across the same 30 repeated runs already summarized
+    # by train.py. This is additive and does not alter image composition or
+    # any of the existing statistical analyses below.
+    try:
+        save_run_variability(pre_para, models=tuple(MODELS), out_dir=out_dir)
+    except Exception as e:
+        print(f"[skip] 30-run variability analysis failed for {base_title}: {e}")
+
     for model in MODELS:
         images = collect_images(pre_para, model)
         if not images:
@@ -723,10 +938,10 @@ if __name__ == "__main__":
         common.XAUUSD_15m_tbm_volatility,
         common.XAUUSD_15m_tbm_horizon,
 
-        common.XAUUSD_1d_fthl_volatility,
-        common.XAUUSD_1d_fthl_horizon,
-        common.XAUUSD_1d_tbm_volatility,
-        common.XAUUSD_1d_tbm_horizon,
+        # common.XAUUSD_1d_fthl_volatility,
+        # common.XAUUSD_1d_fthl_horizon,
+        # common.XAUUSD_1d_tbm_volatility,
+        # common.XAUUSD_1d_tbm_horizon,
         ]
     # compose_distribution_overview_grid(paras)
     for pre_para in paras:
@@ -737,3 +952,11 @@ if __name__ == "__main__":
     # score): run this separately once every group has been through
     # run_compose_report at least once.
     detail_all, summary_all, overall_all, overall_score = aggregate_curve_similarity(paras = paras)
+
+    # Consolidated uncertainty tables across all dissertation groups.
+    try:
+        variability_detail_all, variability_summary_all = aggregate_run_variability(paras=paras)
+    except Exception as e:
+        # Variability reporting is supplementary; keep the established
+        # report workflow successful if legacy CSVs do not contain std data.
+        print(f"[skip] aggregate 30-run variability analysis failed: {e}")

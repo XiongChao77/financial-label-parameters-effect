@@ -123,7 +123,7 @@ def _overlay_crossings(crossings_df, series_filter=("empirical_vs_gaussian",),
         )
         ax.text(
             x0, ymax, tag,
-            rotation=270, color=color, fontsize=8,
+            rotation=0, color=color, fontsize=8,
             ha="right", va="top", alpha=0.9,
         )
 
@@ -1716,9 +1716,9 @@ def generate_all_plots(
     """
     _, baseline_df = _split_baseline(self_summary_df)
 
-    # plot_self_eval_mean_std(self_summary_df, save_dir, metric="macro_f1", para_type=para_type, crossings_df=crossings_df)
-    # plot_self_eval_mean_std(self_summary_df, save_dir, metric="accuracy", para_type=para_type, crossings_df=crossings_df)
-    # plot_self_eval_mean_std(self_summary_df, save_dir, metric="mcc", para_type=para_type, crossings_df=crossings_df)
+    plot_self_eval_mean_std(self_summary_df, save_dir, metric="macro_f1", para_type=para_type, crossings_df=crossings_df)
+    plot_self_eval_mean_std(self_summary_df, save_dir, metric="accuracy", para_type=para_type, crossings_df=crossings_df)
+    plot_self_eval_mean_std(self_summary_df, save_dir, metric="mcc", para_type=para_type, crossings_df=crossings_df)
 
     # plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="macro_f1", total_runs=total_runs, para_type=para_type, baseline_df=baseline_df)
     # plot_cross_train_batch_summary(cross_train_batch_summary_df, save_dir, metric="mcc", total_runs=total_runs, para_type=para_type, baseline_df=baseline_df)
@@ -1851,6 +1851,7 @@ def load_and_plot(save_dir: str, pre_para: common.BaseDefine) -> None:
 
 if __name__ == "__main__":
     for pre_para in [
+        common.XAUUSD_15m_tbm_volatility,
         # common.BTC_15m_fthl_volatility,
         # common.BTC_15m_fthl_horizon,
         # common.BTC_15m_tbm_volatility,
