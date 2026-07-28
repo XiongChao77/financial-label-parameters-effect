@@ -18,3 +18,5 @@ launch.json
 data_process/massive/data/*
 massive_key.json
 .vscode
+results
+node_modules

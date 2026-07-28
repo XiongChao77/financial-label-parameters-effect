@@ -266,7 +266,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode", 
         choices=["plot", "label", "batch_label"], 
-        default="plot",
+        default="batch_label",
         help="Action to perform: 'plot' the distribution or 'label' the data and run stats (default: label)")
     
     args = parser.parse_args()
@@ -274,19 +274,19 @@ if __name__ == "__main__":
     
     groups = [
         dict(para=common.BTC_15m_fthl_volatility,     volatility_range=np.arange(0.1, 10.1, 0.1).round(1), predict_num=16),
-        dict(para=common.BTC_15m_fthl_horizon,        horizon_range=np.arange(16, 81, 1),                   vol_multiplier=10),
-        dict(para=common.BTC_15m_tbm_volatility,      volatility_range=np.arange(1.4, 10.1, 0.1).round(1),  predict_num=16),
-        dict(para=common.BTC_15m_tbm_horizon,         horizon_range=np.arange(8, 81, 1),                    vol_multiplier=10),
+        # dict(para=common.BTC_15m_fthl_horizon,        horizon_range=np.arange(16, 81, 1),                   vol_multiplier=10),
+        # dict(para=common.BTC_15m_tbm_volatility,      volatility_range=np.arange(1.4, 10.1, 0.1).round(1),  predict_num=16),
+        # dict(para=common.BTC_15m_tbm_horizon,         horizon_range=np.arange(8, 81, 1),                    vol_multiplier=10),
 
-        dict(para=common.XAUUSD_15m_fthl_volatility,  volatility_range=np.arange(0.2, 15.1, 0.2).round(1),  predict_num=16),
-        dict(para=common.XAUUSD_15m_fthl_horizon,     horizon_range=np.arange(16, 81, 1),                   vol_multiplier=10),
-        dict(para=common.XAUUSD_15m_tbm_volatility,   volatility_range=np.arange(1.2, 15.1, 0.2),           predict_num=16),  # 注：此行原来就没有 .round(1)
-        dict(para=common.XAUUSD_15m_tbm_horizon,      horizon_range=np.arange(8, 81, 1),                    vol_multiplier=10),
+        # dict(para=common.XAUUSD_15m_fthl_volatility,  volatility_range=np.arange(0.2, 15.1, 0.2).round(1),  predict_num=16),
+        # dict(para=common.XAUUSD_15m_fthl_horizon,     horizon_range=np.arange(16, 81, 1),                   vol_multiplier=10),
+        # dict(para=common.XAUUSD_15m_tbm_volatility,   volatility_range=np.arange(1.2, 15.1, 0.2),           predict_num=16),  # 注：此行原来就没有 .round(1)
+        # dict(para=common.XAUUSD_15m_tbm_horizon,      horizon_range=np.arange(8, 81, 1),                    vol_multiplier=10),
 
-        dict(para=common.XAUUSD_1d_fthl_volatility,   volatility_range=np.arange(0.4, 4.1, 0.1).round(1),   predict_num=8),
-        dict(para=common.XAUUSD_1d_fthl_horizon,      horizon_range=np.arange(16, 41, 1),                   vol_multiplier=4),
-        dict(para=common.XAUUSD_1d_tbm_volatility,    volatility_range=np.arange(2, 4.1, 0.1).round(1),     predict_num=8),
-        dict(para=common.XAUUSD_1d_tbm_horizon,       horizon_range=np.arange(8, 41, 1),                    vol_multiplier=4),
+        # dict(para=common.XAUUSD_1d_fthl_volatility,   volatility_range=np.arange(0.4, 4.1, 0.1).round(1),   predict_num=8),
+        # dict(para=common.XAUUSD_1d_fthl_horizon,      horizon_range=np.arange(16, 41, 1),                   vol_multiplier=4),
+        # dict(para=common.XAUUSD_1d_tbm_volatility,    volatility_range=np.arange(2, 4.1, 0.1).round(1),     predict_num=8),
+        # dict(para=common.XAUUSD_1d_tbm_horizon,       horizon_range=np.arange(8, 41, 1),                    vol_multiplier=4),
     ]
 
     for group in groups:

@@ -85,8 +85,9 @@ test_data_path  = os.path.join(DATA_OUT_DIR, "test_data.csv")
 data_config_path  = os.path.join(DATA_OUT_DIR, "data_config_meta.json")
 TRAIN_OUT_DIR = os.path.join(OUTPUT_DIR, "train")
 os.makedirs(TRAIN_OUT_DIR, exist_ok=True)
-
-CONF_DF = 'to_feather'#/'to_feather'/'to_csv'
+LABEL_VIERER_PUBLICE_DIR = os.path.join(DATA_PROCESS_DIR,'label_viewer','public')   #for label_viewer
+if not os.path.islink(LABEL_VIERER_PUBLICE_DIR):   os.symlink(DATA_OUT_DIR, LABEL_VIERER_PUBLICE_DIR)
+CONF_DF = 'to_csv'#/'to_feather'/'to_csv'
 
 def save_train_df(df):
     if os.path.exists(train_data_path):
